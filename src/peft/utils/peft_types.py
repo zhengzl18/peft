@@ -76,6 +76,7 @@ class PeftType(str, enum.Enum):
     SHIRA = "SHIRA"
     C3A = "C3A"
     WAVEFT = "WAVEFT"
+    XXX = "XXX"
 
 
 class TaskType(str, enum.Enum):
