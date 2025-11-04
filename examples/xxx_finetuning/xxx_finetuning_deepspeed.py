@@ -44,6 +44,9 @@ class TrainingArguments(transformers.TrainingArguments):
     model_name_or_path: str = field(default=None)
     knowledge_dataset: list[str] = field(default=None)
     n_knowledge_samples: int = field(default=None)
+    n_param_downsample_rate: float = field(default=1.0)
+    fwd_importance_sampling: bool = field(default=False)
+    bwd_importance_sampling: bool = field(default=False)
     seed: Optional[int] = field(default=42)
     # data_path: str = field(default="meta-math/MetaMathQA", metadata={"help": "Path to the training data."})
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
@@ -68,6 +71,10 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     xxx_scaling: float = field(
         default=None,
+    )
+    lora_r: int = field(
+        default=None,
+        metadata={"help": "The rank of LoRA adapter. When passing `None`, CorDA or full fine-tuning is used."},
     )
 
 
@@ -189,17 +196,21 @@ def train():
 
         dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
         n_knowledge_samples = args.n_knowledge_samples * len(args.knowledge_dataset)
-        path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_{n_knowledge_samples}_{args.seed}"
+        path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
         preprocess_config = XXXPreprocessConfig(
             jacobian_path=f"{CACHE_ROOT}/jacobian/{path_name}",
             sloppy_basis_path=f"{CACHE_ROOT}/sloppy_basis/{path_name}",
             eigen_path=f"{CACHE_ROOT}/eigen/{path_name}",
+            fwd_importance_sampling=args.fwd_importance_sampling,
+            bwd_importance_sampling=args.bwd_importance_sampling,
         )
         xxx_config = XXXConfig(
             r=args.xxx_r,
             scaling=args.xxx_scaling,
             # target_modules=["q_proj",],
-            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+            # target_modules=["q_proj", "k_proj", "v_proj",],
+            # target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "up_proj", "down_proj"],
+            target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
             # target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
             task_type="CAUSAL_LM",
             preprocess_config=preprocess_config,
@@ -208,6 +219,23 @@ def train():
         preprocess_xxx(model, xxx_config, local_rank=args.local_rank)
         print("Getting PEFT model...")
         model = get_peft_model(model, xxx_config)
+    elif args.lora_r is not None:
+        print("Train in LoRA mode")
+        print("Loading base model...")
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            dtype=torch.bfloat16,
+        )
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_r,
+            init_lora_weights = True, #script_args.init_lora_weights,
+            target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
+            lora_dropout=0,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
     else:
         print("Train in Full Finetuning mode")
         model = transformers.AutoModelForCausalLM.from_pretrained(

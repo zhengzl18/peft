@@ -14,6 +14,7 @@
 
 import copy
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
@@ -41,17 +42,16 @@ CACHE_ROOT = "/Data2/zhengzhilong"  # peft/examples/corda_finetuning
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
-    model_name_or_path: str = field(default="facebook/opt-125m")
-    knowledge_dataset: list[str] = field(default_factory=lambda: ["glue/sst2", "glue/mrpc", "glue/mnli", "glue/qqp"])
+    model_name_or_path: str = field(default="meta-llama/Llama-2-7b-hf")
+    knowledge_dataset: list[str] = field(default_factory=lambda: ["nqopen",])
     n_knowledge_samples: int = field(default=256)
+    n_param_downsample_rate: float = field(default=1.0)
     seed: Optional[int] = field(default=233)
-    data_path: str = field(default="glue", metadata={"help": "Path to the training data."})
-    # data_path: str = field(default="fxmeng/pissa-dataset", metadata={"help": "Path to the training data."})
+    data_path: str = field(default="fxmeng/pissa-dataset", metadata={"help": "Path to the training data."})
     dataset_split: str = field(default="train", metadata={"help": "(`['train', 'test', 'eval']`):"})
-    sub_task: list[str] = field(default_factory=lambda: ["cola:100"], metadata={"help": "(`['metamath', 'python', 'conversation']`)"})
-    # dataset_field: list[str] = field(default_factory=lambda: ["instruction", "output"], metadata={"help": "Fields of dataset input and output."})
-    dataset_field: list[str] = field(default_factory=lambda: ["sentence", "label"], metadata={"help": "Fields of dataset input and output."})
-    dataloader_num_proc: int = field(default=16, metadata={"help": "Number of processes to load dataset"})
+    sub_task: list[str] = field(default_factory=lambda: ["metamath:1000"], metadata={"help": "(`['metamath', 'python', 'conversation']`)"})
+    dataset_field: list[str] = field(default_factory=lambda: ["instruction", "output"], metadata={"help": "Fields of dataset input and output."})
+    dataloader_num_proc: int = field(default=1, metadata={"help": "Number of processes to load dataset"})
     dataloader_batch_size: int = field(
         default=3000,
         metadata={
@@ -69,6 +69,10 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     xxx_scaling: float = field(
         default=100.0,
+    )
+    lora_r: int = field(
+        default=128,
+        metadata={"help": "The rank of LoRA adapter. When passing `None`, CorDA or full fine-tuning is used."},
     )
 
 
@@ -186,7 +190,7 @@ def train():
         )
         dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
         n_knowledge_samples = args.n_knowledge_samples * len(args.knowledge_dataset)
-        path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_{n_knowledge_samples}_{args.seed}"
+        path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
         preprocess_config = XXXPreprocessConfig(
             jacobian_path=f"{CACHE_ROOT}/jacobian/{path_name}",
             sloppy_basis_path=f"{CACHE_ROOT}/sloppy_basis/{path_name}",
@@ -195,9 +199,9 @@ def train():
         xxx_config = XXXConfig(
             r=args.xxx_r,
             scaling=args.xxx_scaling,
-            target_modules=["q_proj",],
-            # target_modules=["q_proj", "k_proj", "v_proj", "out_proj",],
-            # target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
+            # target_modules=["q_proj", "fc1"],
+            # target_modules=["q_proj",],
+            target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
             task_type="CAUSAL_LM",
             preprocess_config=preprocess_config,
         )
@@ -205,6 +209,23 @@ def train():
         preprocess_xxx(model, xxx_config)
         print("Getting PEFT model...")
         model = get_peft_model(model, xxx_config)
+    elif args.lora_r is not None:
+        print("Train in LoRA mode")
+        print("Loading base model...")
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            dtype=torch.bfloat16,
+        )
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_r,
+            init_lora_weights=True, #script_args.init_lora_weights,
+            target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
+            lora_dropout=0,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
     else:
         print("Train in Full Finetuning mode")
         model = transformers.AutoModelForCausalLM.from_pretrained(

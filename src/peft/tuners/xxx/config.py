@@ -76,6 +76,27 @@ class XXXPreprocessConfig:
             )
         },
     )
+    n_param_downsample_rate: float = field(
+        default=1.0,
+    )
+    fwd_importance_sampling: bool = field(
+        default=False,
+    )
+    fwd_importance_score_path: Optional[str] = field(
+        default=None,
+    )
+    bwd_importance_sampling: bool = field(
+        default=False,
+    )
+    bwd_importance_score_path: Optional[str] = field(
+        default=None,
+    )
+    task_oriented_sloppy_basis: bool = field(
+        default=False,
+    )
+    task_jacobian_path: Optional[str] = field(
+        default=None,
+    )
     verbose: bool = field(default=False, metadata={"help": "If true, prints the progress of CorDA initialization."})
     use_float16_for_jacobian: bool = field(
         default=False,

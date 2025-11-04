@@ -26,7 +26,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import get_peft_model
 from peft.tuners.lora.config import LoraConfig
 from peft.tuners.xxx.config import XXXConfig, XXXPreprocessConfig
-from peft.tuners.xxx.utils import preprocess_xxx
+from peft.tuners.xxx.utils import preprocess_xxx, calculate_importance_score
 
 CACHE_ROOT = "/Data2/zhengzhilong"  # peft/examples/corda_finetuning
 
@@ -75,26 +75,64 @@ def main(args):
         nsamples=args.n_knowledge_samples, 
         seed=args.seed
     )
+    if args.fwd_importance_sampling:
+        task_loader = get_knowledge_data(
+            name=args.task_dataset, 
+            tokenizer=tokenizer, 
+            model_id=model_id, 
+            nsamples=args.n_task_samples, 
+            seed=args.seed
+        )
 
     # Evaluate the original model
     print("\n---- model before svd ---\n")
     print(model)
 
-    # Perform decomposition
     dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
     n_knowledge_samples = args.n_knowledge_samples * len(args.knowledge_dataset)
-    path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_{n_knowledge_samples}_{args.seed}"
+    path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
     preprocess_config = XXXPreprocessConfig(
         jacobian_path=f"{CACHE_ROOT}/jacobian/{path_name}",
         sloppy_basis_path=f"{CACHE_ROOT}/sloppy_basis/{path_name}",
         eigen_path=f"{CACHE_ROOT}/eigen/{path_name}",
+        n_param_downsample_rate=args.n_param_downsample_rate,
     )
+    if args.fwd_importance_sampling:
+        preprocess_config.fwd_importance_sampling = True
+        preprocess_config.fwd_importance_score_path = f"{CACHE_ROOT}/fwd_importance_score/{path_name}"
+    if args.bwd_importance_sampling:
+        preprocess_config.bwd_importance_sampling = True
+        preprocess_config.bwd_importance_score_path = f"{CACHE_ROOT}/bwd_importance_score/{path_name}"
+    if args.task_oriented_sloppy_basis:
+        preprocess_config.task_oriented_sloppy_basis = True
+        assert args.task_jacobian_path is not None, "task_jacobian_path must be provided when task_oriented_sloppy_basis is True"
+        task_dataset_name = "_".join(sorted(args.task_dataset)).replace("/", "_")
+        n_task_samples = args.n_task_samples * len(args.task_dataset)
+        task_jacobian_path = f"{CACHE_ROOT}/jacobian/{task_dataset_name}_{args.model_id.replace('/', '_')}_{n_task_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+
+    
     xxx_config = XXXConfig(
         r=args.r,
-        # target_modules=["q_proj", "v_proj"],
-        target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
+        target_modules=args.target_modules,
         preprocess_config=preprocess_config,
     )
+    if args.fwd_importance_sampling:
+        calculate_importance_score(
+            model,
+            task_loader,
+            xxx_config,
+            mode="abs",
+            save_path=preprocess_config.fwd_importance_score_path,
+        )
+    if args.bwd_importance_sampling:
+        calculate_importance_score(
+            model,
+            knowledge_loader,
+            xxx_config,
+            mode="abs",
+            save_path=preprocess_config.bwd_importance_score_path,
+        )
+
     preprocess_xxx(
         model,
         xxx_config,
@@ -129,7 +167,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_id",
         type=str,
-        default="facebook/opt-125m",
+        default="meta-llama/Llama-2-7b-hf",
+        help="Pretrained model ID",
+    )
+    parser.add_argument(
+        "--target_modules",
+        type=str,
+        nargs="+",
+        default=["q_proj", "gate_proj",],
         help="Pretrained model ID",
     )
     parser.add_argument(
@@ -142,21 +187,48 @@ if __name__ == "__main__":
         "--knowledge_dataset",
         type=str,
         nargs="+",
-        # default=["MetaMATH"],
-        # default=["glue/cola",],
-        default=["glue/sst2", "glue/mrpc", "glue/mnli", "glue/qqp"],
-        choices=[
-            "wikitext2",
-            "c4",
-            "ptb",
-            "traivia_qa",
-            "nqopen",
-            "MetaMATH",
-            "codefeedback",
-            "WizLMinstruct",
-            "alpaca",
-        ],
+        default=["nqopen",],
+        choices=[],
         help="knowledge dataset",
+    )
+    parser.add_argument(
+        "--n_param_downsample_rate",
+        type=float,
+        default=0.001,
+    )
+    parser.add_argument(
+        "--fwd_importance_sampling",
+        type=bool,
+        default=True,
+    )
+    parser.add_argument(
+        "--bwd_importance_sampling",
+        type=bool,
+        default=True,
+    )
+    parser.add_argument(
+        "--task_oriented_sloppy_basis",
+        type=bool,
+        default=True,
+    )
+    parser.add_argument(
+        "--task_jacobian_path",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--task_dataset",
+        type=str,
+        nargs="+",
+        default=["MetaMATH"],
+        choices=[],
+        help="task dataset",
+    )
+    parser.add_argument(
+        "--n_task_samples",
+        type=int,
+        default=256,
+        help="number of samples used for covariance matrices",
     )
     parser.add_argument(
         "--seed",

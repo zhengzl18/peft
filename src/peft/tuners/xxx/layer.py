@@ -36,12 +36,13 @@ class XXXLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names: tuple[str, ...] = ("xxx_coeff",)
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names: tuple[str, ...] = ("r", "xxx_sloppy_basis_w", "scaling",)
+    other_param_names: tuple[str, ...] = ("r", "xxx_sloppy_basis_w", "xxx_sloppy_basis_w_mask_indice", "scaling",)
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
         self.r = {}
         self.xxx_sloppy_basis_w = nn.ModuleDict({})  # Currently there is no `BufferDict` in torch.nn, this is a workaround to ensure proper device handling
+        self.xxx_sloppy_basis_w_mask_indice = nn.ModuleDict({})
         self.scaling = {}
         self.xxx_coeff = nn.ParameterDict({})
         # Mark the weight as unmerged
@@ -75,6 +76,9 @@ class XXXLayer(BaseTunerLayer):
 
         self.r[adapter_name] = r
         self.xxx_sloppy_basis_w[adapter_name] = BufferWrapper(xxx_sloppy_basis["weight"])
+        mask = xxx_sloppy_basis["weight_mask"]
+        indice = torch.stack([mask // self.in_features, mask % self.in_features])
+        self.xxx_sloppy_basis_w_mask_indice[adapter_name] = BufferWrapper(indice)
         # TODO: sanity check for shape of xxx_sloppy_basis
 
         # Actual trainable parameters
@@ -232,13 +236,26 @@ class Linear(nn.Module, XXXLayer):
 
         coeff = self.xxx_coeff[adapter]
         sloppy_basis = self.xxx_sloppy_basis_w[adapter]().to(dtype)
+        mask_indice = self.xxx_sloppy_basis_w_mask_indice[adapter]()
+        scaling = self.scaling[adapter]
 
         if cast_to_fp32:
             coeff = coeff.float()
             sloppy_basis = sloppy_basis.float()
         
-        output_tensor = (coeff @ sloppy_basis.T).reshape(self.out_features, self.in_features)
-        output_tensor = transpose(output_tensor, self.fan_in_fan_out) * self.scaling[adapter]
+        # output_tensor = torch.zeros(self.out_features * self.in_features, dtype=coeff.dtype, device=coeff.device)
+        # output_tensor[mask] = coeff @ sloppy_basis.T * self.scaling[adapter]
+        # output_tensor = output_tensor.reshape(self.out_features, self.in_features)
+        
+        output_tensor = torch.sparse_coo_tensor(
+            indices=mask_indice,
+            values=coeff @ sloppy_basis.T * scaling,
+            size=(self.out_features, self.in_features),
+            dtype=coeff.dtype,
+            device=coeff.device
+        )
+        # output_tensor = (coeff @ sloppy_basis.T).reshape(self.out_features, self.in_features)
+        # output_tensor = transpose(output_tensor, self.fan_in_fan_out) 
 
         if cast_to_fp32:
             output_tensor = output_tensor.to(dtype=dtype)
@@ -269,13 +286,19 @@ class Linear(nn.Module, XXXLayer):
 
                 coeff = self.xxx_coeff[active_adapter]
                 sloppy_basis = self.xxx_sloppy_basis_w[active_adapter]()
+                mask_indice = self.xxx_sloppy_basis_w_mask_indice[active_adapter]()
                 scaling = self.scaling[active_adapter]
                 x = self._cast_input_dtype(x, coeff.dtype)
-                sloppy_basis = self._cast_input_dtype(sloppy_basis, coeff.dtype)
-                delta_weight = (coeff @ sloppy_basis.T).view(self.out_features, self.in_features)
-                delta_weight = transpose(delta_weight, self.fan_in_fan_out) * scaling
+                sloppy_basis = self._cast_input_dtype(sloppy_basis, coeff.dtype)  # TODO: maybe shouldn't use this function here
+                delta_weight = torch.sparse_coo_tensor(
+                    indices=mask_indice,
+                    values=coeff @ sloppy_basis.T * scaling,
+                    size=(self.out_features, self.in_features),
+                    dtype=coeff.dtype,
+                    device=coeff.device
+                )
+                # delta_weight = transpose(delta_weight, self.fan_in_fan_out) * scaling
                 result = result + x @ delta_weight.T
-                # print(x @ delta_weight.T)
 
             result = result.to(torch_result_dtype)
 
