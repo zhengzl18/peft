@@ -138,7 +138,7 @@ def get_knowledge_data(name, tokenizer, model_id, nsamples, seed=3):
             PROMPT.format(question=q, answer=a[0])
             for q, a in zip(traindata["question"], traindata["answer"])
         ]
-    elif name == "MetaMATH":
+    elif name == "metamath":
         traindata = load_dataset("fxmeng/pissa-dataset", data_dir="metamath", split="train").shuffle(seed=seed).take(nsamples)
         PROMPT = (
             "Below is an instruction that describes a task. "
