@@ -14,7 +14,7 @@
 
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import numpy as np
@@ -68,15 +68,16 @@ def main(args):
     model = AutoModelForCausalLM.from_pretrained(model_id, device_map="auto")
 
     # Collect data
-    knowledge_loader = get_knowledge_data(
+    knowledge_data_loader = get_knowledge_data(
         name=args.knowledge_dataset, 
         tokenizer=tokenizer, 
         model_id=model_id, 
         nsamples=args.n_knowledge_samples, 
         seed=args.seed
     )
-    if args.fwd_importance_sampling:
-        task_loader = get_knowledge_data(
+    task_data_loader = None
+    if args.fwd_importance_sampling or args.task_oriented_sloppy_basis:
+        task_data_loader = get_knowledge_data(
             name=args.task_dataset, 
             tokenizer=tokenizer, 
             model_id=model_id, 
@@ -89,11 +90,16 @@ def main(args):
     print(model)
 
     dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
+    if args.task_oriented_sloppy_basis:
+        task_dataset_name = "_".join(sorted(args.task_dataset)).replace("/", "_")
+    else:
+        task_dataset_name = "none"
     n_knowledge_samples = args.n_knowledge_samples * len(args.knowledge_dataset)
     path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+    sloppy_basis_path_name = f"kldg_{dataset_name}_task_{task_dataset_name}_{args.model_id.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}_r{args.r}"
     preprocess_config = XXXPreprocessConfig(
         jacobian_path=f"{CACHE_ROOT}/jacobian/{path_name}",
-        sloppy_basis_path=f"{CACHE_ROOT}/sloppy_basis/{path_name}",
+        sloppy_basis_path=f"{CACHE_ROOT}/sloppy_basis/{sloppy_basis_path_name}",
         eigen_path=f"{CACHE_ROOT}/eigen/{path_name}",
         n_param_downsample_rate=args.n_param_downsample_rate,
     )
@@ -105,10 +111,10 @@ def main(args):
         preprocess_config.bwd_importance_score_path = f"{CACHE_ROOT}/bwd_importance_score/{path_name}"
     if args.task_oriented_sloppy_basis:
         preprocess_config.task_oriented_sloppy_basis = True
-        assert args.task_jacobian_path is not None, "task_jacobian_path must be provided when task_oriented_sloppy_basis is True"
         task_dataset_name = "_".join(sorted(args.task_dataset)).replace("/", "_")
         n_task_samples = args.n_task_samples * len(args.task_dataset)
-        task_jacobian_path = f"{CACHE_ROOT}/jacobian/{task_dataset_name}_{args.model_id.replace('/', '_')}_{n_task_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+        task_jacobian_path = f"{CACHE_ROOT}/task_jacobian/{task_dataset_name}_{args.model_id.replace('/', '_')}_{n_task_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+        preprocess_config.task_jacobian_path = task_jacobian_path
 
     
     xxx_config = XXXConfig(
@@ -119,7 +125,7 @@ def main(args):
     if args.fwd_importance_sampling:
         calculate_importance_score(
             model,
-            task_loader,
+            task_data_loader,
             xxx_config,
             mode="abs",
             save_path=preprocess_config.fwd_importance_score_path,
@@ -127,7 +133,7 @@ def main(args):
     if args.bwd_importance_sampling:
         calculate_importance_score(
             model,
-            knowledge_loader,
+            knowledge_data_loader,
             xxx_config,
             mode="abs",
             save_path=preprocess_config.bwd_importance_score_path,
@@ -136,7 +142,8 @@ def main(args):
     preprocess_xxx(
         model,
         xxx_config,
-        knowledge_loader,
+        knowledge_data_loader=knowledge_data_loader,
+        task_data_loader=task_data_loader
     )
     model = get_peft_model(model, xxx_config)
 
@@ -174,7 +181,7 @@ if __name__ == "__main__":
         "--target_modules",
         type=str,
         nargs="+",
-        default=["q_proj", "gate_proj",],
+        default=["gate_proj",],
         help="Pretrained model ID",
     )
     parser.add_argument(
@@ -194,33 +201,28 @@ if __name__ == "__main__":
     parser.add_argument(
         "--n_param_downsample_rate",
         type=float,
-        default=0.001,
+        default=0.01,
     )
     parser.add_argument(
         "--fwd_importance_sampling",
         type=bool,
-        default=True,
+        default=False,
     )
     parser.add_argument(
         "--bwd_importance_sampling",
         type=bool,
-        default=True,
+        default=False,
     )
     parser.add_argument(
         "--task_oriented_sloppy_basis",
         type=bool,
-        default=True,
-    )
-    parser.add_argument(
-        "--task_jacobian_path",
-        type=str,
-        default=None,
+        default=False,
     )
     parser.add_argument(
         "--task_dataset",
         type=str,
         nargs="+",
-        default=["MetaMATH"],
+        default=["metamath"],
         choices=[],
         help="task dataset",
     )

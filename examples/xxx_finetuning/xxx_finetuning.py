@@ -45,7 +45,11 @@ class TrainingArguments(transformers.TrainingArguments):
     model_name_or_path: str = field(default="meta-llama/Llama-2-7b-hf")
     knowledge_dataset: list[str] = field(default_factory=lambda: ["nqopen",])
     n_knowledge_samples: int = field(default=256)
-    n_param_downsample_rate: float = field(default=1.0)
+    n_param_downsample_rate: float = field(default=0.001)
+    fwd_importance_sampling: bool = field(default=False)
+    bwd_importance_sampling: bool = field(default=True)
+    task_oriented_sloppy_basis: bool = field(default=False)
+    task_dataset: list[str] = field(default=None)
     seed: Optional[int] = field(default=233)
     data_path: str = field(default="fxmeng/pissa-dataset", metadata={"help": "Path to the training data."})
     dataset_split: str = field(default="train", metadata={"help": "(`['train', 'test', 'eval']`):"})
@@ -188,19 +192,22 @@ def train():
             dtype=torch.bfloat16,
             device_map="auto",
         )
+        
         dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
+        if args.task_oriented_sloppy_basis:
+            task_dataset_name = "_".join(sorted(args.task_dataset)).replace("/", "_")
+        else:
+            task_dataset_name = "none"
         n_knowledge_samples = args.n_knowledge_samples * len(args.knowledge_dataset)
-        path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+        path_name = f"kldg_{dataset_name}_task_{task_dataset_name}_{args.model_name_or_path.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}_r{args.xxx_r}"
         preprocess_config = XXXPreprocessConfig(
-            jacobian_path=f"{CACHE_ROOT}/jacobian/{path_name}",
             sloppy_basis_path=f"{CACHE_ROOT}/sloppy_basis/{path_name}",
-            eigen_path=f"{CACHE_ROOT}/eigen/{path_name}",
+            fwd_importance_sampling=args.fwd_importance_sampling,
+            bwd_importance_sampling=args.bwd_importance_sampling,
         )
         xxx_config = XXXConfig(
             r=args.xxx_r,
             scaling=args.xxx_scaling,
-            # target_modules=["q_proj", "fc1"],
-            # target_modules=["q_proj",],
             target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
             task_type="CAUSAL_LM",
             preprocess_config=preprocess_config,

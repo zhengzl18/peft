@@ -103,7 +103,8 @@ def get_param_downsample_mask(
 def preprocess_xxx(
     model: nn.Module,
     xxx_config: XXXConfig,
-    knowledge_loader: Optional[List[Dict[str, torch.Tensor]]] = None,
+    knowledge_data_loader: Optional[List[Dict[str, torch.Tensor]]] = None,
+    task_data_loader: Optional[List[Dict[str, torch.Tensor]]] = None,
     local_rank: int = 0,
 ):
     """
@@ -142,6 +143,7 @@ def preprocess_xxx(
     eigen_path = xxx_config.preprocess_config.eigen_path
     fwd_importance_sampling = xxx_config.preprocess_config.fwd_importance_sampling
     bwd_importance_sampling = xxx_config.preprocess_config.bwd_importance_sampling
+    task_oriented_sloppy_basis = xxx_config.preprocess_config.task_oriented_sloppy_basis
     use_cache = False
 
     # If cache exists, skip building
@@ -158,7 +160,7 @@ def preprocess_xxx(
                 use_cache = False
                 break
             else:
-                print(f"Loading sloppy basis for {name} on cuda:{local_rank} ...")
+                print(f"Loading sloppy basis from {sloppy_basis_path}/{file_name}.pt on cuda:{local_rank} ...")
                 # sloppy_basis = torch.load(f"{sloppy_basis_path}/{file_name}.pt", map_location=get_model_device(model))
                 sloppy_basis = torch.load(f"{sloppy_basis_path}/{file_name}.pt", map_location=f"cuda:{local_rank}")
                 for k, v in sloppy_basis.items():
@@ -179,7 +181,7 @@ def preprocess_xxx(
         # if not os.path.exists(jacobian_path) or not os.listdir(jacobian_path):
         calculate_jacobian(
             model, 
-            knowledge_loader, 
+            knowledge_data_loader, 
             xxx_config, 
             jacobian_path,
         )
@@ -187,11 +189,17 @@ def preprocess_xxx(
         # Calculate eigens
         # calculate_eigens(model, xxx_config, jacobian_path, eigen_path)
 
-        # Crop CorDA eigens so that there's less to save
-        calculate_sloppy_basis(model, xxx_config, jacobian_path, sloppy_basis_path, eigen_path=eigen_path, target_jacobian_path=None)
+        if task_oriented_sloppy_basis:
+            calculate_jacobian(
+                model, 
+                task_data_loader, 
+                xxx_config, 
+                xxx_config.preprocess_config.task_jacobian_path,
+                mask_path=jacobian_path,
+            )
 
-        # if sloppy_basis_path is not None:
-        #     os.makedirs(sloppy_basis_path, exist_ok=True)
+        # Crop CorDA eigens so that there's less to save
+        calculate_sloppy_basis(model, xxx_config, jacobian_path, sloppy_basis_path, eigen_path=eigen_path)
 
         for name, module in target_modules(model, xxx_config):
             # Load sloppy basis from disk
@@ -206,9 +214,10 @@ def preprocess_xxx(
 
 def calculate_jacobian(
     model: nn.Module,
-    knowledge_loader: List[Dict[str, torch.Tensor]],
+    data_loader: List[Dict[str, torch.Tensor]],
     config: XXXConfig,
-    jacobian_path: str,
+    save_path: str,
+    mask_path: Optional[str] = None,
 ):
     n_param_downsample_rate = config.preprocess_config.n_param_downsample_rate
     fwd_importance_sampling = config.preprocess_config.fwd_importance_sampling
@@ -217,7 +226,7 @@ def calculate_jacobian(
     bwd_importance_score_path = config.preprocess_config.bwd_importance_score_path
     
     model.train()
-    os.makedirs(jacobian_path, exist_ok=True)
+    os.makedirs(save_path, exist_ok=True)
     for name, p in target_params(model, config):
         assert len(p.shape) <= 2
         assert '-' not in name
@@ -226,27 +235,32 @@ def calculate_jacobian(
             file_name += f"_fwd"
         if bwd_importance_sampling:
             file_name += f"_bwd"
-        
-        if os.path.exists(f"{jacobian_path}/{file_name}.pt"):
+
+        if os.path.exists(f"{save_path}/{file_name}.pt"):
             print(f"Jacobian file for {name} already exists, skipping.")
             continue
+        
         print(f"Calculating jacobian for {name} ...")
         for param in model.parameters():
             param.requires_grad = False
         grads = []
         p.requires_grad = True  # Only compute gradient for the target parameter
 
-        mask = get_param_downsample_mask(
-            name,
-            p.numel(), 
-            n_param_downsample_rate,
-            fwd_importance_sampling,
-            fwd_importance_score_path,
-            bwd_importance_sampling,
-            bwd_importance_score_path
-        )
-        # mask = torch.randperm(p.numel())[:int(p.numel() * n_param_downsample_rate)].clone()  # Sample params based on downsample rate
-        for data in tqdm(knowledge_loader):
+        if mask_path is not None:
+            assert os.path.exists(f"{mask_path}/{file_name}.pt"), f"Mask file for {name} not found in {mask_path}."
+            mask = torch.load(f"{mask_path}/{file_name}.pt", map_location=get_model_device(model))['mask']
+        else:
+            mask = get_param_downsample_mask(
+                name,
+                p.numel(), 
+                n_param_downsample_rate,
+                fwd_importance_sampling,
+                fwd_importance_score_path,
+                bwd_importance_sampling,
+                bwd_importance_score_path
+            )
+
+        for data in tqdm(data_loader):
             data = {k: v.to(model.device) for k, v in data.items()}
             model.zero_grad()
             outputs = model(**data)
@@ -257,7 +271,7 @@ def calculate_jacobian(
         
         # stack grads into jacobian matrix
         jac = torch.stack(grads, dim=0)
-        torch.save(dict(jac=jac, mask=mask), f"{jacobian_path}/{file_name}.pt")
+        torch.save(dict(jac=jac, mask=mask), f"{save_path}/{file_name}.pt")
 
 def calculate_importance_score(
     model: nn.Module,
@@ -329,14 +343,16 @@ def calculate_sloppy_basis(
     model: nn.Module,
     config: LoraConfig,
     jacobian_path: str,
-    sloppy_basis_path: str,
-    target_jacobian_path: Optional[str] = None,
+    save_path: str,
+    # task_jacobian_path: Optional[str] = None,
     eigen_path: Optional[str] = None,
 ):
     fwd_importance_sampling = config.preprocess_config.fwd_importance_sampling
     bwd_importance_sampling = config.preprocess_config.bwd_importance_sampling
+    task_oriented_sloppy_basis = config.preprocess_config.task_oriented_sloppy_basis
+    task_jacobian_path = config.preprocess_config.task_jacobian_path
     # all_module_sloppy_basis = {}
-    os.makedirs(sloppy_basis_path, exist_ok=True)
+    os.makedirs(save_path, exist_ok=True)
     for name, _ in target_params(model, config):
         param_name = name.split('.')[-1]
         param_file_name = name.replace('.', '-')
@@ -348,7 +364,7 @@ def calculate_sloppy_basis(
         if bwd_importance_sampling:
             param_file_name += "_bwd"
             module_file_name += "_bwd"
-        if os.path.exists(f"{sloppy_basis_path}/{module_file_name}.pt"):
+        if os.path.exists(f"{save_path}/{module_file_name}.pt"):
             print(f"Sloppy basis file for {name} already exists, skipping.")
             continue
         print(f"Calculating sloppy basis for {name} ...")
@@ -388,17 +404,20 @@ def calculate_sloppy_basis(
         
         num_params = stiff_vecs.shape[0]
         use_random_vecs = True
-        if target_jacobian_path is not None:
+        if task_oriented_sloppy_basis:
             use_random_vecs = False
             try:
-                target_jac = torch.load(
-                    f"{target_jacobian_path}/{param_file_name}.pt", 
+                task_jac_and_mask = torch.load(
+                    f"{task_jacobian_path}/{param_file_name}.pt", 
                     map_location=get_model_device(model)
                 )
-                assert target_jac.shape[0] >= rank
-                assert target_jac.shape[1] == num_params
-                projection = stiff_vecs @ (stiff_vecs.T @ target_jac.T)
-                sloppy_vecs = target_jac.T - projection
+                task_jac = task_jac_and_mask['jac']
+                task_mask = task_jac_and_mask['mask']
+                assert task_jac.shape[0] >= rank
+                assert task_jac.shape[1] == num_params
+                assert torch.equal(mask, task_mask), "Mask mismatch between knowledge jacobian and task jacobian."
+                projection = stiff_vecs @ (stiff_vecs.T @ task_jac.T)
+                sloppy_vecs = task_jac.T - projection
             except FileNotFoundError:
                 use_random_vecs = True
 
@@ -418,7 +437,7 @@ def calculate_sloppy_basis(
                 param_name: sloppy_basis[:, :rank].clone().to(model.dtype),
                 f"{param_name}_mask": mask
             },
-            f"{sloppy_basis_path}/{module_file_name}.pt"
+            f"{save_path}/{module_file_name}.pt"
         )  #! FIXME: this only supports weight param
         # all_module_sloppy_basis[module_name][param_name] = sloppy_basis[:, :rank].clone().to(model.dtype)  # Shape: (num_params, rank)
         # del random_vecs, projection, sloppy_vecs, sloppy_basis, stiff_vecs  # free memory

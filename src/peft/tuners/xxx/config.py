@@ -47,15 +47,6 @@ class XXXPreprocessConfig:
         prune_temporary_fields (`bool`):
             If true, temporary fields generated in CorDA preprocessing will be pruned. Defaults to `True`.
     """
-    jacobian_path: str = field(
-        metadata={
-            "help": (
-                "File to store the jacobian matrix. If you wish to train multiple models with different ranks, but "
-                "they sample from the same dataset, you can store the jacobian matrix and reuse it for different ranks. "
-                "Note that jacobian file is usually large (comparable to model size), so you will need sufficient storage."
-            )
-        },
-    )
     sloppy_basis_path: str = field(
         metadata={
             "help": (
@@ -63,6 +54,16 @@ class XXXPreprocessConfig:
                 "residual model of Llama-3-8b is 15GB, while SVD cache is 1.4GB), but with SVD cache and original model "
                 "weights, residual model weights can be built quickly. If you need to reuse residual model weights with "
                 "limited storage, you can store the SVD cache instead."
+            )
+        },
+    )
+    jacobian_path: Optinal[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "File to store the jacobian matrix. If you wish to train multiple models with different ranks, but "
+                "they sample from the same dataset, you can store the jacobian matrix and reuse it for different ranks. "
+                "Note that jacobian file is usually large (comparable to model size), so you will need sufficient storage."
             )
         },
     )
