@@ -46,7 +46,6 @@ def target_modules(model: nn.Module, config: XXXConfig) -> Iterable[nn.Module]:
     """
     for name, module in model.named_modules():
         # todo: change LoraModel to XXXModel
-        # todo: change LoraModel to XXXModel
         if LoraModel._check_target_module_exists(config, name) and isinstance(module, nn.Linear):
             yield name, module
 
@@ -280,6 +279,7 @@ def load_jacobian(
                     jac[k] = v
             jacobian[param_name.split('.')[-1]] = jac
         module.xxx_jacobian = jacobian
+
 
 class ProjectionCallback(TrainerCallback):
     """
