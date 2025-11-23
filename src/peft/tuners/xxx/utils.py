@@ -271,7 +271,7 @@ def load_jacobian(
             items = [(k, v) for k, v in jac.items()]
             for k, v in items:
                 if "mask" not in k:
-                    normalized_jac, _ = torch.linalg.qr(jac[k].T)
+                    normalized_jac, _ = torch.linalg.qr(jac[k][:64].T)
                     quantized_jac, quant_state = quantize_blockwise(normalized_jac)
                     jac[k] = quantized_jac
                     jac["quant_state"] = quant_state
@@ -293,9 +293,8 @@ class ProjectionCallback(TrainerCallback):
                 delta_weight = module.xxx_delta_weight[model.active_adapter]
                 jacobian = module.xxx_jacobian_w[model.active_adapter]()
                 quant_state = module.xxx_jacobian_w_quant_state[model.active_adapter]
-                # jacobian = jacobian.to(delta_weight.dtype)
                 jacobian = dequantize_blockwise(jacobian, quant_state)
-                print("\nnorm before projection:", delta_weight.data.norm().item())
+                # print("\nnorm before projection:", delta_weight.data.norm().item())
                 delta_weight.data = delta_weight.data - delta_weight.data @ jacobian @ jacobian.T
-                print("norm after projection:", delta_weight.data.norm().item())
+                # print("norm after projection:", delta_weight.data.norm().item())
         return control
