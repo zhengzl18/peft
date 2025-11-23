@@ -35,7 +35,7 @@ PROMPT = (
     "### Instruction:\n{instruction}\n\n### Response:"
 )
 
-CACHE_ROOT = "/Data2/zhengzhilong"  # peft/examples/corda_finetuning
+CACHE_ROOT = "/home/fit/lishbo/WORK/data/zhengzhilong/anticf"  # peft/examples/corda_finetuning
 
 
 @dataclass

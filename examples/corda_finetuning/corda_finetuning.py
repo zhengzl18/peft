@@ -64,9 +64,10 @@ def get_nb_trainable_parameters(model) -> tuple[int, int]:
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
-    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
-    dataset_split: str = field(default="train[:100000]", metadata={"help": "(`['train', 'test', 'eval']`):"})
-    dataset_field: list[str] = field(default=None, metadata={"help": "Fields of dataset input and output."})
+    data_path: str = field(default="HuggingFaceH4/Code-Feedback", metadata={"help": "Path to the training data."})
+    dataset_split: str = field(default="train_sft[:100000]", metadata={"help": "(`['train', 'test', 'eval']`):"})
+    dataset_field: list[str] = field(default_factory=lambda:["messages",], metadata={"help": "Fields of dataset input and output."})
+    # dataset_field: list[str] = field(default_factory=lambda:["question", "answer"], metadata={"help": "Fields of dataset input and output."})
     dataloader_num_proc: int = field(default=16, metadata={"help": "Number of processes to load dataset"})
     dataloader_batch_size: int = field(
         default=3000,
@@ -80,7 +81,7 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
     lora_r: int = field(
-        default=None,
+        default=384,
         metadata={"help": "The rank of LoRA adapter. When passing `None`, CorDA or full fine-tuning is used."},
     )
     corda_mode: bool = field(default=True, metadata={"help": "True for CorDA mode"})
@@ -206,9 +207,16 @@ def train():
             script_args.model_name_or_path,
             device_map="auto",
         )
-        model = PeftModel.from_pretrained(
-            res_model, script_args.model_name_or_path, subfolder="corda_init", is_trainable=True
+        lora_config = LoraConfig(
+            r=script_args.lora_r,
+            lora_alpha=script_args.lora_r,
+            init_lora_weights = True, #script_args.init_lora_weights,
+            target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+            lora_dropout=0,
+            bias="none",
+            task_type="CAUSAL_LM",
         )
+        model = get_peft_model(res_model, lora_config)
     elif script_args.lora_r is not None:
         print("Train in LoRA mode")
         model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -241,11 +249,12 @@ def train():
         model_max_length=script_args.model_max_length,
         padding_side="right",
         use_fast=True,
-        trust_remote_code=True,
+        # trust_remote_code=True,
     )
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
     raw_train_datasets = load_dataset(script_args.data_path, split=script_args.dataset_split)
+    train_tokenize_function(raw_train_datasets[0:3], tokenizer, "question", "answer")
     train_dataset = raw_train_datasets.map(
         train_tokenize_function,
         batched=True,

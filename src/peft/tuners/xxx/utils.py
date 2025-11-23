@@ -21,6 +21,7 @@ from typing import Dict, List, Optional
 
 from peft.tuners.xxx.config import XXXConfig, XXXPreprocessConfig
 from peft.tuners.xxx.layer import XXXLayer
+from peft.tuners.xxx.layer import XXXLayer
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -28,6 +29,8 @@ from tqdm import tqdm
 from peft.tuners.lora.config import LoraConfig
 from peft.tuners.lora.model import LoraModel
 from peft.utils.other import get_pattern_key
+from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
+from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise
 
@@ -40,15 +43,18 @@ EPS = 1e-20
     
 
 def target_modules(model: nn.Module, config: XXXConfig) -> Iterable[nn.Module]:
+def target_modules(model: nn.Module, config: XXXConfig) -> Iterable[nn.Module]:
     """
     Iterate over CorDA target name and modules of a model. A module is a target if its name is in
     `config.target_modules` and is `nn.Linear`.
     """
     for name, module in model.named_modules():
         # todo: change LoraModel to XXXModel
+        # todo: change LoraModel to XXXModel
         if LoraModel._check_target_module_exists(config, name) and isinstance(module, nn.Linear):
             yield name, module
 
+def target_params(model: nn.Module, config: XXXConfig) -> Iterable[nn.Parameter]:
 def target_params(model: nn.Module, config: XXXConfig) -> Iterable[nn.Parameter]:
     # TODO: maybe support bias
     for name, module in target_modules(model, config):

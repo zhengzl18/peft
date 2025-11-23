@@ -59,8 +59,12 @@ class XXXModel(BaseTuner):
         assert hasattr(target, "xxx_jacobian"), f"Jacobian has not been initialized for {target}. Please run preprocess_xxx first."
         xxx_jacobian = target.xxx_jacobian
         del target.xxx_jacobian
+        assert hasattr(target, "xxx_jacobian"), f"Jacobian has not been initialized for {target}. Please run preprocess_xxx first."
+        xxx_jacobian = target.xxx_jacobian
+        del target.xxx_jacobian
 
         kwargs = {
+            "xxx_jacobian": xxx_jacobian,
             "xxx_jacobian": xxx_jacobian,
             "fan_in_fan_out": xxx_config.fan_in_fan_out,
         }
@@ -69,6 +73,7 @@ class XXXModel(BaseTuner):
         if isinstance(target, XXXLayer):
             target.update_layer(
                 adapter_name,
+                xxx_jacobian=xxx_jacobian,
                 xxx_jacobian=xxx_jacobian,
                 inference_mode=xxx_config.inference_mode,
             )

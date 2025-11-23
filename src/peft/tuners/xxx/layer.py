@@ -35,11 +35,17 @@ class BufferWrapper(nn.Module):
 class XXXLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names: tuple[str, ...] = ("xxx_delta_weight",)
+    adapter_layer_names: tuple[str, ...] = ("xxx_delta_weight",)
     # All names of other parameters that may contain adapter-related parameters
+    other_param_names: tuple[str, ...] = ("xxx_jacobian_w", "xxx_jacobian_w_mask_indice", "xxx_jacobian_w_quant_state",)
     other_param_names: tuple[str, ...] = ("xxx_jacobian_w", "xxx_jacobian_w_mask_indice", "xxx_jacobian_w_quant_state",)
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
+        self.xxx_jacobian_w = nn.ModuleDict({})  # Currently there is no `BufferDict` in torch.nn, this is a workaround to ensure proper device handling
+        self.xxx_jacobian_w_mask_indice = nn.ModuleDict({})
+        self.xxx_delta_weight = nn.ParameterDict({})
+        self.xxx_jacobian_w_quant_state = {}
         self.xxx_jacobian_w = nn.ModuleDict({})  # Currently there is no `BufferDict` in torch.nn, this is a workaround to ensure proper device handling
         self.xxx_jacobian_w_mask_indice = nn.ModuleDict({})
         self.xxx_delta_weight = nn.ParameterDict({})
@@ -61,6 +67,7 @@ class XXXLayer(BaseTunerLayer):
         self,
         adapter_name,
         xxx_jacobian: Dict[str, torch.Tensor],
+        xxx_jacobian: Dict[str, torch.Tensor],
         inference_mode: bool = False,
         **kwargs,
     ):
@@ -77,10 +84,13 @@ class XXXLayer(BaseTunerLayer):
 
         # Actual trainable parameters
         self.xxx_delta_weight[adapter_name] = nn.Parameter(torch.zeros(mask.shape[0]))
+        self.xxx_delta_weight[adapter_name] = nn.Parameter(torch.zeros(mask.shape[0]))
 
 
         # call this before init of the lora variants
         self._move_adapter_to_device_of_base_layer(adapter_name)
+
+        # self._register_project_gradient_hook(adapter_name)
 
         # self._register_project_gradient_hook(adapter_name)
 
@@ -92,6 +102,31 @@ class XXXLayer(BaseTunerLayer):
     # def _cache_pop(self, key: str) -> Any:
     #     value = self._caches.pop(key)
     #     return value
+    def _register_project_gradient_hook(self, adapter_name: str) -> None:
+        """Register the gradient projection hook for the given adapter
+
+        Args:
+            adapter_name (str):
+                The name of the adapter for which the gradient projection hook should be registered.
+        """
+
+        def _project_gradient(grad: torch.Tensor) -> torch.Tensor:
+            """Project the gradient to the subspace spanned by the Jacobian
+
+            Args:
+                grad (torch.Tensor):
+                    The gradient to be projected.
+            """
+            jacobian = self.xxx_jacobian_w[adapter_name]()
+            jacobian = jacobian.to(grad.dtype)
+            # projected_grad = grad
+            projected_grad = grad - grad @ jacobian @ jacobian.T
+            print("grad@J:", (projected_grad @ jacobian).abs().mean())
+            print("dw@J:", (self.xxx_delta_weight[adapter_name] @ jacobian).abs().mean())
+            return projected_grad
+
+        self.xxx_delta_weight[adapter_name].register_hook(_project_gradient)
+
     def _register_project_gradient_hook(self, adapter_name: str) -> None:
         """Register the gradient projection hook for the given adapter
 
@@ -153,6 +188,7 @@ class Linear(nn.Module, XXXLayer):
         base_layer,
         adapter_name: str,
         xxx_jacobian: Dict[str, torch.Tensor],
+        xxx_jacobian: Dict[str, torch.Tensor],
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
         **kwargs,
     ) -> None:
@@ -163,6 +199,7 @@ class Linear(nn.Module, XXXLayer):
         self._active_adapter = adapter_name
         self.update_layer(
             adapter_name,
+            xxx_jacobian=xxx_jacobian,
             xxx_jacobian=xxx_jacobian,
         )
 
@@ -185,6 +222,7 @@ class Linear(nn.Module, XXXLayer):
             return
 
         for active_adapter in adapter_names:
+            if active_adapter in self.xxx_delta_weight.keys():
             if active_adapter in self.xxx_delta_weight.keys():
                 base_layer = self.get_base_layer()
                 if safe_merge:
@@ -219,6 +257,7 @@ class Linear(nn.Module, XXXLayer):
         while len(self.merged_adapters) > 0:
             active_adapter = self.merged_adapters.pop()
             if active_adapter in self.xxx_delta_weight.keys():
+            if active_adapter in self.xxx_delta_weight.keys():
                 weight = self.get_base_layer().weight
                 orig_dtype = weight.dtype
                 delta_weight = self.get_delta_weight(active_adapter)
@@ -234,6 +273,8 @@ class Linear(nn.Module, XXXLayer):
         """
         device = self.xxx_delta_weight[adapter].device
         dtype = self.xxx_delta_weight[adapter].dtype
+        device = self.xxx_delta_weight[adapter].device
+        dtype = self.xxx_delta_weight[adapter].dtype
 
         # In case users wants to merge the adapter weights that are in
         # (b)float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
@@ -242,14 +283,20 @@ class Linear(nn.Module, XXXLayer):
 
         delta_weight = self.xxx_delta_weight[adapter]
         mask_indice = self.xxx_jacobian_w_mask_indice[adapter]()
+        delta_weight = self.xxx_delta_weight[adapter]
+        mask_indice = self.xxx_jacobian_w_mask_indice[adapter]()
 
         if cast_to_fp32:
+            delta_weight = delta_weight.float()
             delta_weight = delta_weight.float()
         
         output_tensor = torch.sparse_coo_tensor(
             indices=mask_indice,
             values=delta_weight,
+            values=delta_weight,
             size=(self.out_features, self.in_features),
+            dtype=delta_weight.dtype,
+            device=delta_weight.device
             dtype=delta_weight.dtype,
             device=delta_weight.device
         )
@@ -258,6 +305,8 @@ class Linear(nn.Module, XXXLayer):
             output_tensor = output_tensor.to(dtype=dtype)
 
             # cast back the weights
+            self.xxx_delta_weight[adapter].data = delta_weight.to(dtype)
+            # TODO: check whether this is necessary, whether we should also cast back jacobian
             self.xxx_delta_weight[adapter].data = delta_weight.to(dtype)
             # TODO: check whether this is necessary, whether we should also cast back jacobian
 
@@ -277,7 +326,9 @@ class Linear(nn.Module, XXXLayer):
             torch_result_dtype = result.dtype
 
             xxx_delta_weight_keys = self.xxx_delta_weight.keys()
+            xxx_delta_weight_keys = self.xxx_delta_weight.keys()
             for active_adapter in self.active_adapters:
+                if active_adapter not in xxx_delta_weight_keys:
                 if active_adapter not in xxx_delta_weight_keys:
                     continue
 
@@ -287,7 +338,10 @@ class Linear(nn.Module, XXXLayer):
                 delta_weight = torch.sparse_coo_tensor(
                     indices=mask_indice,
                     values=delta_weight,
+                    values=delta_weight,
                     size=(self.out_features, self.in_features),
+                    dtype=delta_weight.dtype,
+                    device=delta_weight.device
                     dtype=delta_weight.dtype,
                     device=delta_weight.device
                 )

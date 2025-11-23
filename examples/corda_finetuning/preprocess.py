@@ -14,6 +14,7 @@
 
 import argparse
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 import numpy as np
 import torch
@@ -25,6 +26,7 @@ from peft import get_peft_model
 from peft.tuners.lora.config import CordaConfig, LoraConfig
 from peft.tuners.lora.corda import preprocess_corda
 
+ROOT = os.path.dirname(os.path.abspath(__file__))  # peft/examples/corda_finetuning
 
 @torch.no_grad()
 def run_model(model, calib_loader):
@@ -49,7 +51,7 @@ def main(args):
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, device_map="auto", torch_dtype=torch.float16, trust_remote_code=True
+        model_id, device_map="auto", dtype=torch.float16, trust_remote_code=True
     )
 
     # Collect data
@@ -62,10 +64,12 @@ def main(args):
     # Perform decomposition
     corda_config = CordaConfig(
         corda_method="ipm" if args.first_eigen else "kpm",
+        cache_file=f"{ROOT}/cache/eigens_{args.calib_dataset}_{model_id.replace('/', '_')}_{args.calib_loader_size}_{args.seed}.npz",
+        covariance_file=f"{ROOT}/cache/covariance_{args.calib_dataset}_{model_id.replace('/', '_')}_{args.calib_loader_size}_{args.seed}.npz",
     )
     lora_config = LoraConfig(
         init_lora_weights="corda",
-        target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"],
         r=args.r,
         lora_alpha=args.r,
         corda_config=corda_config,
@@ -105,7 +109,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model_id",
         type=str,
-        default="meta-llama/Llama-2-7b-hf",
+        default="facebook/opt-125m",
         help="Pretrained model ID",
     )
     parser.add_argument(
@@ -117,7 +121,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--calib_dataset",
         type=str,
-        default="wikitext2",
+        default="nqopen",
         choices=[
             "wikitext2",
             "c4",
@@ -145,7 +149,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--r",
         type=int,
-        default=None,
+        default=128,
     )
     parser.add_argument(
         "--first_eigen",
@@ -153,12 +157,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--save_model",
+        default=True,
         action="store_true",
     )
     parser.add_argument(
         "--save_path",
         type=str,
-        default=None,
+        default=f"{ROOT}/opt_125m_corda_init",
     )
     args = parser.parse_args()
 

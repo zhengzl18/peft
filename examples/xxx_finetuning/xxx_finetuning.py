@@ -14,12 +14,13 @@
 
 import copy
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
 
 from peft.tuners.xxx.config import XXXConfig, XXXPreprocessConfig
+from peft.tuners.xxx.utils import ProjectionCallback, preprocess_xxx
 from peft.tuners.xxx.utils import ProjectionCallback, preprocess_xxx
 import torch
 import transformers
@@ -37,7 +38,7 @@ PROMPT = (
     "### Instruction:\n{instruction}\n\n### Response:"
 )
 
-CACHE_ROOT = "/Data2/zhengzhilong"  # peft/examples/corda_finetuning
+CACHE_ROOT = "/home/fit/lishbo/WORK/data/zhengzhilong/anticf"  # peft/examples/corda_finetuning
 
 
 @dataclass
@@ -187,7 +188,9 @@ def train():
         dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
         n_knowledge_samples = args.n_knowledge_samples * len(args.knowledge_dataset)
         path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+        path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
         preprocess_config = XXXPreprocessConfig(
+            jacobian_path=f"{CACHE_ROOT}/jacobian/{path_name}",
             jacobian_path=f"{CACHE_ROOT}/jacobian/{path_name}",
             fwd_importance_sampling=args.fwd_importance_sampling,
             bwd_importance_sampling=args.bwd_importance_sampling,
@@ -277,6 +280,8 @@ def train():
         "data_collator": data_collator,
     }
     trainer = Trainer(model=model, processing_class=tokenizer, args=args, **data_module)
+    projection_callback = ProjectionCallback()
+    trainer.add_callback(projection_callback)
     projection_callback = ProjectionCallback()
     trainer.add_callback(projection_callback)
     if args.local_rank == 0:
