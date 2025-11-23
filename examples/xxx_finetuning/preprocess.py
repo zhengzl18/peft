@@ -76,7 +76,7 @@ def main(args):
         seed=args.seed
     )
     task_data_loader = None
-    if args.fwd_importance_sampling or args.task_oriented_sloppy_basis:
+    if args.fwd_importance_sampling:
         task_data_loader = get_knowledge_data(
             name=args.task_dataset, 
             tokenizer=tokenizer, 
@@ -90,17 +90,10 @@ def main(args):
     print(model)
 
     dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
-    if args.task_oriented_sloppy_basis:
-        task_dataset_name = "_".join(sorted(args.task_dataset)).replace("/", "_")
-    else:
-        task_dataset_name = "none"
     n_knowledge_samples = args.n_knowledge_samples * len(args.knowledge_dataset)
     path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
-    sloppy_basis_path_name = f"kldg_{dataset_name}_task_{task_dataset_name}_{args.model_id.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}_r{args.r}"
     preprocess_config = XXXPreprocessConfig(
         jacobian_path=f"{CACHE_ROOT}/jacobian/{path_name}",
-        sloppy_basis_path=f"{CACHE_ROOT}/sloppy_basis/{sloppy_basis_path_name}",
-        eigen_path=f"{CACHE_ROOT}/eigen/{path_name}",
         n_param_downsample_rate=args.n_param_downsample_rate,
     )
     if args.fwd_importance_sampling:
@@ -109,16 +102,8 @@ def main(args):
     if args.bwd_importance_sampling:
         preprocess_config.bwd_importance_sampling = True
         preprocess_config.bwd_importance_score_path = f"{CACHE_ROOT}/bwd_importance_score/{path_name}"
-    if args.task_oriented_sloppy_basis:
-        preprocess_config.task_oriented_sloppy_basis = True
-        task_dataset_name = "_".join(sorted(args.task_dataset)).replace("/", "_")
-        n_task_samples = args.n_task_samples * len(args.task_dataset)
-        task_jacobian_path = f"{CACHE_ROOT}/task_jacobian/{task_dataset_name}_{args.model_id.replace('/', '_')}_{n_task_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
-        preprocess_config.task_jacobian_path = task_jacobian_path
-
     
     xxx_config = XXXConfig(
-        r=args.r,
         target_modules=args.target_modules,
         preprocess_config=preprocess_config,
     )
@@ -150,24 +135,6 @@ def main(args):
     # Evaluate again to check if the model is consistent
     # Using `model.model` here because `get_peft_model` wraps a layer to the model
     print(model)
-
-    # Save as hugging face model
-    # if args.save_model:
-    #     assert args.save_path is not None
-    #     save_path = args.save_path
-
-    #     # Save CorDA modules
-    #     model.peft_config["default"].init_lora_weights = True
-    #     model.save_pretrained(os.path.join(save_path, "corda_init"))
-
-    #     # Save residual model
-    #     model = model.unload()
-    #     model.save_pretrained(save_path)
-
-    #     # Save tokenizer
-    #     tokenizer.save_pretrained(save_path)
-    #     print(f"Done building CorDA huggingface model in {save_path}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -214,45 +181,11 @@ if __name__ == "__main__":
         default=False,
     )
     parser.add_argument(
-        "--task_oriented_sloppy_basis",
-        type=bool,
-        default=False,
-    )
-    parser.add_argument(
-        "--task_dataset",
-        type=str,
-        nargs="+",
-        default=["metamath"],
-        choices=[],
-        help="task dataset",
-    )
-    parser.add_argument(
-        "--n_task_samples",
-        type=int,
-        default=256,
-        help="number of samples used for covariance matrices",
-    )
-    parser.add_argument(
         "--seed",
         type=int,
         default=233,
         help="random seed",
     )
-    parser.add_argument(
-        "--r",
-        type=int,
-        default=128,
-    )
-    # parser.add_argument(
-    #     "--save_model",
-    #     default=True,
-    #     action="store_true",
-    # )
-    # parser.add_argument(
-    #     "--save_path",
-    #     type=str,
-    #     default=f"{CACHE_ROOT}/opt_125m_corda_init",
-    # )
     args = parser.parse_args()
 
     main(args)

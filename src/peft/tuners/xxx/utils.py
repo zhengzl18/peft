@@ -21,7 +21,6 @@ from typing import Dict, List, Optional
 
 from peft.tuners.xxx.config import XXXConfig, XXXPreprocessConfig
 from peft.tuners.xxx.layer import XXXLayer
-from peft.tuners.xxx.layer import XXXLayer
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -29,8 +28,6 @@ from tqdm import tqdm
 from peft.tuners.lora.config import LoraConfig
 from peft.tuners.lora.model import LoraModel
 from peft.utils.other import get_pattern_key
-from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
-from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise
 
@@ -43,7 +40,6 @@ EPS = 1e-20
     
 
 def target_modules(model: nn.Module, config: XXXConfig) -> Iterable[nn.Module]:
-def target_modules(model: nn.Module, config: XXXConfig) -> Iterable[nn.Module]:
     """
     Iterate over CorDA target name and modules of a model. A module is a target if its name is in
     `config.target_modules` and is `nn.Linear`.
@@ -54,7 +50,6 @@ def target_modules(model: nn.Module, config: XXXConfig) -> Iterable[nn.Module]:
         if LoraModel._check_target_module_exists(config, name) and isinstance(module, nn.Linear):
             yield name, module
 
-def target_params(model: nn.Module, config: XXXConfig) -> Iterable[nn.Parameter]:
 def target_params(model: nn.Module, config: XXXConfig) -> Iterable[nn.Parameter]:
     # TODO: maybe support bias
     for name, module in target_modules(model, config):
@@ -115,7 +110,7 @@ def preprocess_xxx(
     local_rank: int = 0,
 ):
     """
-    Build necessary CorDA fields for a model.
+    Build necessary XXX fields for a model.
 
     For each `M * N` linear layer, a `M * M` jacobian matrix will be built temporarily during the preprocessing
     process, consuming roughly another `2 * MODEL_SIZE` memory for typical LLMs if model weight is FP16 and jacobian
@@ -124,48 +119,27 @@ def preprocess_xxx(
     Args:
         model (`nn.Module`):
             Model to preprocess.
-        lora_config (`LoraConfig`):
-            Lora configuration of the model. `preprocess_config` should be set.
-        run_model (`Optional[Callable[[], None]]`):
-            Callback to run the model when building jacobian. Typically you should run model inference on your sample
-            dataset in this callback. Experiments have shown that when token count per sample is 2048, hidden dimension
-            is 4096, collecting 256 distinct samples is enough. If you collect too few or too repetitive samples, the
-            jacobian matrix may be low-ranked and unstabilize preprocessing. You can estimate sample count as
-            `HIDDEN_DIM / TOKEN_PER_SAMPLE * 128`. `run_model` can be `None` only if jacobian file in
-            `preprocess_config` is already created.
-        hooked_model (`Optional[nn.Module]`):
-            Model to hook when building jacobian. If none, original model will be hooked. This is only useful when
-            you want to hook a different model than the one you are training, typically you should leave this `None`.
-
-    Upon completion, the following fields are set for each target module:
-        eigens.S_WC (`torch.Tensor`):
-            Singular values of the weight matrix.
-        eigens.U_WC (`torch.Tensor`):
-            Left singular vectors of the weight matrix.
-        eigens.V_WC (`torch.Tensor`):
-            Right singular vectors of the weight matrix, multiplied by inverse of jacobian matrix.
+        xxx_config (`XXXConfig`):
+            XXX configuration of the model. `preprocess_config` should be set.
     """
     jacobian_path = xxx_config.preprocess_config.jacobian_path
+    assert jacobian_path is not None, "jacobian_path in preprocess_config should be specified for CorDA preprocessing."
+    os.makedirs(jacobian_path, exist_ok=True)
 
-    # If cache exists, skip building
-    if jacobian_path is not None and os.path.exists(jacobian_path) and os.listdir(jacobian_path):
-        try:
-            load_jacobian(model, xxx_config, local_rank)
-        except FileNotFoundError as e:
-            print(e)
+    try:
+        load_jacobian(model, xxx_config, local_rank)
+    except FileNotFoundError as e:
+        print(e)
 
-            # Calculate jacobian matrix
-            calculate_jacobian(
-                model, 
-                knowledge_data_loader, 
-                xxx_config, 
-                jacobian_path,
-            )
+        # Calculate jacobian matrix
+        calculate_jacobian(
+            model, 
+            knowledge_data_loader, 
+            xxx_config, 
+            jacobian_path,
+        )
 
-            # Calculate eigens
-            # calculate_eigens(model, xxx_config, jacobian_path, eigen_path)
-
-            load_jacobian(model, xxx_config, local_rank)
+        load_jacobian(model, xxx_config, local_rank)
 
 def calculate_jacobian(
     model: nn.Module,
@@ -267,31 +241,6 @@ def calculate_importance_score(
             grad[name] /= len(data_loader)
             assert '-' not in name
             torch.save(grad[name], f"{save_path}/{name.replace('.', '-')}.pt")
-
-@torch.no_grad()
-def calculate_eigens(
-    model: nn.Module,
-    config: LoraConfig,
-    jacobian_path: str,
-    eigen_path: Optional[str] = None,
-):
-    """Call collect_eigens_for_layer and store result in key `eigens` of each layer."""
-    for name, _ in target_params(model, config):
-        module_name = '.'.join(name.split('.')[:-1])
-        r_key = get_pattern_key(config.rank_pattern.keys(), module_name)
-        rank = config.rank_pattern.get(r_key, config.r)
-        try:
-            jac = torch.load(f"{jacobian_path}/{name.replace('.', '-')}.pt", map_location=get_model_device(model))
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Jacobian file for {name} not found in {jacobian_path}.")
-        if jac.shape[0] <= jac.shape[1] - rank:
-            # Data samples num is smaller than param dim,
-            # no need to perform svd
-            pass
-        else:
-            # TODO: svd
-            assert eigen_path is not None
-            pass
 
 def load_jacobian(
     model: nn.Module,

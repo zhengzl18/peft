@@ -35,18 +35,7 @@ class XXXPreprocessConfig:
         quantize_jacobian (`bool`):
             If true, quantizes the jacobian matrix to int8. This can reduce the memory usage of the jacobian matrix by 4x.
     """
-    jacobian_path: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "File to store the jacobian matrix. If you wish to train multiple models with different ranks, but "
-                "they sample from the same dataset, you can store the jacobian matrix and reuse it for different ranks. "
-                "Note that jacobian file is usually large (comparable to model size), so you will need sufficient storage."
-            )
-        },
-    )
-    eigen_path: Optional[str] = field(
-        default=None,
+    jacobian_path: str = field(
         metadata={
             "help": (
                 "File to store the jacobian matrix. If you wish to train multiple models with different ranks, but "
