@@ -15,15 +15,12 @@ from __future__ import annotations
 
 import warnings
 from typing import Optional
-
 import torch
-
 from peft.tuners.tuners_utils import (
     BaseTuner,
     BaseTunerLayer,
 )
 from peft.utils import TRANSFORMERS_MODELS_TO_XXX_TARGET_MODULES_MAPPING
-from peft.utils.other import get_pattern_key
 
 from .layer import XXXLayer, Linear
 
@@ -59,19 +56,12 @@ class XXXModel(BaseTuner):
                     "one LoRA adapter per model with `target_parameters` is allowed."
                 )
 
-        # Regexp matching - Find key which matches current target_name in patterns provided
-        r_key = get_pattern_key(xxx_config.rank_pattern.keys(), current_key)
-        scaling_key = get_pattern_key(xxx_config.scaling_pattern.keys(), current_key)
-        r = xxx_config.rank_pattern.get(r_key, xxx_config.r)
-        scaling = xxx_config.scaling_pattern.get(scaling_key, xxx_config.scaling)
-
-        assert hasattr(target, "xxx_sloppy_basis"), f"Sloppy bases have not been initialized for {target}. Please run preprocess_xxx first."
-        xxx_sloppy_basis = target.xxx_sloppy_basis
+        assert hasattr(target, "xxx_jacobian"), f"Jacobian has not been initialized for {target}. Please run preprocess_xxx first."
+        xxx_jacobian = target.xxx_jacobian
+        del target.xxx_jacobian
 
         kwargs = {
-            "xxx_sloppy_basis": xxx_sloppy_basis,
-            "r": r,
-            "scaling": scaling,
+            "xxx_jacobian": xxx_jacobian,
             "fan_in_fan_out": xxx_config.fan_in_fan_out,
         }
 
@@ -79,9 +69,7 @@ class XXXModel(BaseTuner):
         if isinstance(target, XXXLayer):
             target.update_layer(
                 adapter_name,
-                r,
-                xxx_sloppy_basis=xxx_sloppy_basis,
-                scaling=xxx_config.scaling,
+                xxx_jacobian=xxx_jacobian,
                 inference_mode=xxx_config.inference_mode,
             )
         else:

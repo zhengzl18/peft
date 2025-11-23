@@ -13,19 +13,18 @@
 # limitations under the License.
 
 import copy
-import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
 
 from peft.tuners.xxx.config import XXXConfig, XXXPreprocessConfig
-from peft.tuners.xxx.utils import preprocess_xxx
+from peft.tuners.xxx.utils import ProjectionCallback, preprocess_xxx
 import torch
 import transformers
 from datasets import load_dataset, concatenate_datasets
 from transformers import Trainer
 
-from peft import LoraConfig, PeftModel, get_peft_model
+from peft import LoraConfig, get_peft_model
 
 
 IGNORE_INDEX = -100
@@ -47,10 +46,7 @@ class TrainingArguments(transformers.TrainingArguments):
     n_param_downsample_rate: float = field(default=1.0)
     fwd_importance_sampling: bool = field(default=False)
     bwd_importance_sampling: bool = field(default=False)
-    task_oriented_sloppy_basis: bool = field(default=False)
-    task_dataset: list[str] = field(default=None)
     seed: Optional[int] = field(default=42)
-    # data_path: str = field(default="meta-math/MetaMathQA", metadata={"help": "Path to the training data."})
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
     dataset_split: str = field(default=None, metadata={"help": "(`['train', 'test', 'eval']`):"})
     sub_task: list[str] = field(default=None, metadata={"help": "(`['metamath', 'python', 'conversation']`)"})
@@ -66,13 +62,6 @@ class TrainingArguments(transformers.TrainingArguments):
     model_max_length: int = field(
         default=512,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
-    )
-    xxx_r: int = field(
-        default=None,
-        metadata={"help": "The rank of LoRA adapter. When passing `None`, CorDA or full fine-tuning is used."},
-    )
-    xxx_scaling: float = field(
-        default=None,
     )
     lora_r: int = field(
         default=None,
@@ -187,7 +176,7 @@ def train():
     args = parser.parse_args_into_dataclasses()[0]
     print(args)
 
-    if args.xxx_r is not None:
+    if args.n_knowledge_samples is not None:
         print("Train in XXX mode")
         print("Loading base model...")
         model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -197,20 +186,14 @@ def train():
         print(model)
 
         dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
-        if args.task_oriented_sloppy_basis:
-            task_dataset_name = "_".join(sorted(args.task_dataset)).replace("/", "_")
-        else:
-            task_dataset_name = "none"
         n_knowledge_samples = args.n_knowledge_samples * len(args.knowledge_dataset)
-        path_name = f"kldg_{dataset_name}_task_{task_dataset_name}_{args.model_name_or_path.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}_r{args.xxx_r}"
+        path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
         preprocess_config = XXXPreprocessConfig(
-            sloppy_basis_path=f"{CACHE_ROOT}/sloppy_basis/{path_name}",
+            jacobian_path=f"{CACHE_ROOT}/jacobian/{path_name}",
             fwd_importance_sampling=args.fwd_importance_sampling,
             bwd_importance_sampling=args.bwd_importance_sampling,
         )
         xxx_config = XXXConfig(
-            r=args.xxx_r,
-            scaling=args.xxx_scaling,
             # target_modules=["q_proj", "o_proj", "k_proj", "v_proj",],
             target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
             task_type="CAUSAL_LM",
@@ -270,20 +253,11 @@ def train():
             ds = load_dataset(args.data_path, name=cur_task, split=cur_split)
         else:
             ds = load_dataset(args.data_path, data_dir=cur_task, split=cur_split)
-        # if script_args.local_rank == 0:
-        #     print(f"{script_args.data_path}/{cur_task}/{cur_split}/{ds.num_rows}")
-        #     for k,v in ds[0].items():
-        #         print("-"*100)
-        #         print(k,end=':\t')
-        #         print(v)
-        #     print("+"*100)
         all_training_dataset.append(ds)
 
     raw_train_datasets = concatenate_datasets(all_training_dataset)
 
-    # if script_args.local_rank > 0: 
     torch.distributed.barrier()
-    # train_tokenize_function(raw_train_datasets[0:3], tokenizer, "instruction", "output")
     train_dataset = raw_train_datasets.map(
         train_tokenize_function,
         batched=True,
@@ -298,8 +272,6 @@ def train():
             "response": args.dataset_field[1],
         },
     )
-
-    # if script_args.local_rank == 0:
     torch.distributed.barrier()
 
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
@@ -310,6 +282,8 @@ def train():
     trainer = Trainer(
         model=model, tokenizer=tokenizer, args=args, **data_module
     )
+    projection_callback = ProjectionCallback()
+    trainer.add_callback(projection_callback)
     trainer.train()
     trainer.save_state()
     model = model.merge_and_unload()

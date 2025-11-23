@@ -34,17 +34,16 @@ class BufferWrapper(nn.Module):
 
 class XXXLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
-    adapter_layer_names: tuple[str, ...] = ("xxx_coeff",)
+    adapter_layer_names: tuple[str, ...] = ("xxx_delta_weight",)
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names: tuple[str, ...] = ("r", "xxx_sloppy_basis_w", "xxx_sloppy_basis_w_mask_indice", "scaling",)
+    other_param_names: tuple[str, ...] = ("xxx_jacobian_w", "xxx_jacobian_w_mask_indice", "xxx_jacobian_w_quant_state",)
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
-        self.r = {}
-        self.xxx_sloppy_basis_w = nn.ModuleDict({})  # Currently there is no `BufferDict` in torch.nn, this is a workaround to ensure proper device handling
-        self.xxx_sloppy_basis_w_mask_indice = nn.ModuleDict({})
-        self.scaling = {}
-        self.xxx_coeff = nn.ParameterDict({})
+        self.xxx_jacobian_w = nn.ModuleDict({})  # Currently there is no `BufferDict` in torch.nn, this is a workaround to ensure proper device handling
+        self.xxx_jacobian_w_mask_indice = nn.ModuleDict({})
+        self.xxx_delta_weight = nn.ParameterDict({})
+        self.xxx_jacobian_w_quant_state = {}
         # Mark the weight as unmerged
         self._disable_adapters = False
         self.merged_adapters = []
@@ -61,9 +60,7 @@ class XXXLayer(BaseTunerLayer):
     def update_layer(
         self,
         adapter_name,
-        xxx_sloppy_basis,
-        r,
-        scaling,
+        xxx_jacobian: Dict[str, torch.Tensor],
         inference_mode: bool = False,
         **kwargs,
     ):
@@ -71,23 +68,21 @@ class XXXLayer(BaseTunerLayer):
         kwargs = locals().copy()
         del kwargs["self"]
 
-        if r <= 0:
-            raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
-
-        self.r[adapter_name] = r
-        self.xxx_sloppy_basis_w[adapter_name] = BufferWrapper(xxx_sloppy_basis["weight"])
-        mask = xxx_sloppy_basis["weight_mask"]
+        self.xxx_jacobian_w[adapter_name] = BufferWrapper(xxx_jacobian["weight"]["jac"])
+        mask = xxx_jacobian["weight"]["mask"]
         indice = torch.stack([mask // self.in_features, mask % self.in_features])
-        self.xxx_sloppy_basis_w_mask_indice[adapter_name] = BufferWrapper(indice)
-        # TODO: sanity check for shape of xxx_sloppy_basis
+        self.xxx_jacobian_w_mask_indice[adapter_name] = BufferWrapper(indice)
+        # TODO: sanity check for shape of xxx_jacobian
+        self.xxx_jacobian_w_quant_state[adapter_name] = xxx_jacobian["weight"]["quant_state"]
 
         # Actual trainable parameters
-        self.xxx_coeff[adapter_name] = nn.Parameter(torch.zeros(r))
+        self.xxx_delta_weight[adapter_name] = nn.Parameter(torch.zeros(mask.shape[0]))
 
-        self.scaling[adapter_name] = scaling
 
         # call this before init of the lora variants
         self._move_adapter_to_device_of_base_layer(adapter_name)
+
+        # self._register_project_gradient_hook(adapter_name)
 
         self.set_adapter(self.active_adapters, inference_mode=inference_mode)
 
@@ -97,16 +92,31 @@ class XXXLayer(BaseTunerLayer):
     # def _cache_pop(self, key: str) -> Any:
     #     value = self._caches.pop(key)
     #     return value
+    def _register_project_gradient_hook(self, adapter_name: str) -> None:
+        """Register the gradient projection hook for the given adapter
 
-    def set_scale(self, adapter: str, scale: float | int) -> None:
-        """Set the scale of the given adapter to the initial scale multiplied by the provided factor
-
-        The initial scale is determined by the configured `r` (rank) and `xxx_sloppy_basis`.
+        Args:
+            adapter_name (str):
+                The name of the adapter for which the gradient projection hook should be registered.
         """
-        if adapter not in self.scaling:
-            # Ignore the case where the adapter is not in the layer
-            return
-        self.scaling[adapter] = scale * self.xxx_sloppy_basis_w[adapter] / self.r[adapter]
+
+        def _project_gradient(grad: torch.Tensor) -> torch.Tensor:
+            """Project the gradient to the subspace spanned by the Jacobian
+
+            Args:
+                grad (torch.Tensor):
+                    The gradient to be projected.
+            """
+            jacobian = self.xxx_jacobian_w[adapter_name]()
+            jacobian = jacobian.to(grad.dtype)
+            # projected_grad = grad
+            projected_grad = grad - grad @ jacobian @ jacobian.T
+            print("grad@J:", (projected_grad @ jacobian).abs().mean())
+            print("dw@J:", (self.xxx_delta_weight[adapter_name] @ jacobian).abs().mean())
+            return projected_grad
+
+        self.xxx_delta_weight[adapter_name].register_hook(_project_gradient)
+
 
     def _check_forward_args(self, x, *args, **kwargs):
         """Check if the arguments are compatible with the configs and state of the model"""
@@ -142,9 +152,7 @@ class Linear(nn.Module, XXXLayer):
         self,
         base_layer,
         adapter_name: str,
-        xxx_sloppy_basis: Dict[str, torch.Tensor],
-        r: int = 0,
-        scaling: float = 1.0,
+        xxx_jacobian: Dict[str, torch.Tensor],
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
         **kwargs,
     ) -> None:
@@ -155,9 +163,7 @@ class Linear(nn.Module, XXXLayer):
         self._active_adapter = adapter_name
         self.update_layer(
             adapter_name,
-            xxx_sloppy_basis=xxx_sloppy_basis,
-            r=r,
-            scaling=scaling
+            xxx_jacobian=xxx_jacobian,
         )
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
@@ -179,7 +185,7 @@ class Linear(nn.Module, XXXLayer):
             return
 
         for active_adapter in adapter_names:
-            if active_adapter in self.xxx_coeff.keys():
+            if active_adapter in self.xxx_delta_weight.keys():
                 base_layer = self.get_base_layer()
                 if safe_merge:
                     # Note that safe_merge will be slower than the normal merge
@@ -212,7 +218,7 @@ class Linear(nn.Module, XXXLayer):
             return
         while len(self.merged_adapters) > 0:
             active_adapter = self.merged_adapters.pop()
-            if active_adapter in self.xxx_coeff.keys():
+            if active_adapter in self.xxx_delta_weight.keys():
                 weight = self.get_base_layer().weight
                 orig_dtype = weight.dtype
                 delta_weight = self.get_delta_weight(active_adapter)
@@ -226,43 +232,34 @@ class Linear(nn.Module, XXXLayer):
             adapter (str):
                 The name of the adapter for which the delta weight should be computed.
         """
-        device = self.xxx_coeff[adapter].device
-        dtype = self.xxx_coeff[adapter].dtype
+        device = self.xxx_delta_weight[adapter].device
+        dtype = self.xxx_delta_weight[adapter].dtype
 
         # In case users wants to merge the adapter weights that are in
         # (b)float16 while being on CPU, we need to cast the weights to float32, perform the merge and then cast back to
         # (b)float16 because some CPUs have slow bf16/fp16 matmuls.
         cast_to_fp32 = device.type == "cpu" and (dtype == torch.float16 or dtype == torch.bfloat16)
 
-        coeff = self.xxx_coeff[adapter]
-        sloppy_basis = self.xxx_sloppy_basis_w[adapter]().to(dtype)
-        mask_indice = self.xxx_sloppy_basis_w_mask_indice[adapter]()
-        scaling = self.scaling[adapter]
+        delta_weight = self.xxx_delta_weight[adapter]
+        mask_indice = self.xxx_jacobian_w_mask_indice[adapter]()
 
         if cast_to_fp32:
-            coeff = coeff.float()
-            sloppy_basis = sloppy_basis.float()
-        
-        # output_tensor = torch.zeros(self.out_features * self.in_features, dtype=coeff.dtype, device=coeff.device)
-        # output_tensor[mask] = coeff @ sloppy_basis.T * self.scaling[adapter]
-        # output_tensor = output_tensor.reshape(self.out_features, self.in_features)
+            delta_weight = delta_weight.float()
         
         output_tensor = torch.sparse_coo_tensor(
             indices=mask_indice,
-            values=coeff @ sloppy_basis.T * scaling,
+            values=delta_weight,
             size=(self.out_features, self.in_features),
-            dtype=coeff.dtype,
-            device=coeff.device
+            dtype=delta_weight.dtype,
+            device=delta_weight.device
         )
-        # output_tensor = (coeff @ sloppy_basis.T).reshape(self.out_features, self.in_features)
-        # output_tensor = transpose(output_tensor, self.fan_in_fan_out) 
 
         if cast_to_fp32:
             output_tensor = output_tensor.to(dtype=dtype)
 
             # cast back the weights
-            self.xxx_coeff[adapter].data = coeff.to(dtype)
-            # TODO: check whether this is necessary, whether we should also cast back sloppy_basis
+            self.xxx_delta_weight[adapter].data = delta_weight.to(dtype)
+            # TODO: check whether this is necessary, whether we should also cast back jacobian
 
         return output_tensor
 
@@ -279,25 +276,21 @@ class Linear(nn.Module, XXXLayer):
             result = self.base_layer(x, *args, **kwargs)
             torch_result_dtype = result.dtype
 
-            xxx_coeff_keys = self.xxx_coeff.keys()
+            xxx_delta_weight_keys = self.xxx_delta_weight.keys()
             for active_adapter in self.active_adapters:
-                if active_adapter not in xxx_coeff_keys:
+                if active_adapter not in xxx_delta_weight_keys:
                     continue
 
-                coeff = self.xxx_coeff[active_adapter]
-                sloppy_basis = self.xxx_sloppy_basis_w[active_adapter]()
-                mask_indice = self.xxx_sloppy_basis_w_mask_indice[active_adapter]()
-                scaling = self.scaling[active_adapter]
-                x = self._cast_input_dtype(x, coeff.dtype)
-                sloppy_basis = self._cast_input_dtype(sloppy_basis, coeff.dtype)  # TODO: maybe shouldn't use this function here
+                delta_weight = self.xxx_delta_weight[active_adapter]
+                mask_indice = self.xxx_jacobian_w_mask_indice[active_adapter]()
+                x = self._cast_input_dtype(x, delta_weight.dtype)
                 delta_weight = torch.sparse_coo_tensor(
                     indices=mask_indice,
-                    values=coeff @ sloppy_basis.T * scaling,
+                    values=delta_weight,
                     size=(self.out_features, self.in_features),
-                    dtype=coeff.dtype,
-                    device=coeff.device
+                    dtype=delta_weight.dtype,
+                    device=delta_weight.device
                 )
-                # delta_weight = transpose(delta_weight, self.fan_in_fan_out) * scaling
                 result = result + x @ delta_weight.T
 
             result = result.to(torch_result_dtype)

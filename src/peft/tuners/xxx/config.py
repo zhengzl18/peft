@@ -30,34 +30,12 @@ class XXXPreprocessConfig:
     This is the sub-configuration class to store the configuration of a [`LoraModel`].
 
     Args:
-        cache_file (`Optional[str]`):
-            File to store the SVD cache. The SVD cache is much smaller than the residual model (for example, residual
-            model of Llama-3-8b is 15GB, while SVD cache is 1.4GB), but with SVD cache and original model weights,
-            residual model weights can be built quickly. If you need to reuse residual model weights with limited
-            storage, you can store the SVD cache instead.
-        jacobian_file (`Optional[str]`):
-            File to store the jacobian matrix. If you wish to train multiple models with different ranks, but they
-            sample from the same dataset, you can store the jacobian matrix and reuse it for different ranks. Note
-            that jacobian file is usually large (comparable to model size), so you will need sufficient storage.
-        verbose (`bool`):
-            If true, prints the progress of CorDA initialization. Defaults to `False`.
-        use_float16_for_jacobian (`bool`):
-            If true, uses float16 for the jacobian matrix. This can reduce the memory usage of the jacobian matrix
-            by half, but may lead to numerical instability. Defaults to `False`.
-        prune_temporary_fields (`bool`):
-            If true, temporary fields generated in CorDA preprocessing will be pruned. Defaults to `True`.
+        jacobian_path (`Optional[str]`):
+            File to store the jacobian matrix.
+        quantize_jacobian (`bool`):
+            If true, quantizes the jacobian matrix to int8. This can reduce the memory usage of the jacobian matrix by 4x.
     """
-    sloppy_basis_path: str = field(
-        metadata={
-            "help": (
-                "File to store the SVD cache. The SVD cache is much smaller than the residual model (for example, "
-                "residual model of Llama-3-8b is 15GB, while SVD cache is 1.4GB), but with SVD cache and original model "
-                "weights, residual model weights can be built quickly. If you need to reuse residual model weights with "
-                "limited storage, you can store the SVD cache instead."
-            )
-        },
-    )
-    jacobian_path: Optinal[str] = field(
+    jacobian_path: Optional[str] = field(
         default=None,
         metadata={
             "help": (
@@ -92,30 +70,19 @@ class XXXPreprocessConfig:
     bwd_importance_score_path: Optional[str] = field(
         default=None,
     )
-    task_oriented_sloppy_basis: bool = field(
-        default=False,
-    )
-    task_jacobian_path: Optional[str] = field(
-        default=None,
-    )
     verbose: bool = field(default=False, metadata={"help": "If true, prints the progress of CorDA initialization."})
-    use_float16_for_jacobian: bool = field(
-        default=False,
+    quantize_jacobian: bool = field(
+        default=True,
         metadata={
             "help": (
-                "If true, uses float16 for the jacobian matrix. This can reduce the memory usage of the jacobian matrix "
-                "by half, but may lead to numerical instability."
+                "If true, quantizes the jacobian matrix to int8. This can reduce the memory usage of the jacobian matrix by 4x."
             )
         },
-    )
-    prune_temporary_fields: bool = field(
-        default=True, metadata={"help": "If true, temporary fields generated in CorDA preprocessing will be pruned."}
     )
 
 
 @dataclass
 class XXXConfig(PeftConfig):
-    r: int = field(default=8, metadata={"help": "Lora attention dimension"})
     target_modules: Optional[Union[list[str], str]] = field(
         default=None,
         metadata={
@@ -135,7 +102,6 @@ class XXXConfig(PeftConfig):
         default=None,
         metadata={"help": "List of module names or regex expression of the module names to exclude from Lora."},
     )
-    scaling: float = field(default=1.0, metadata={"help": "Lora alpha"})
     fan_in_fan_out: bool = field(
         default=False,
         metadata={"help": "Set this to True if the layer to replace stores weight like (fan_in, fan_out)"},
@@ -161,24 +127,6 @@ class XXXConfig(PeftConfig):
             "help": "The layer pattern name, used only if `layers_to_transform` is different to None and if the layer pattern is not in the common layers pattern."
             "This only works when target_modules is a list of str. This should target the `nn.ModuleList` of the "
             "model, which is often called `'layers'` or `'h'`."
-        },
-    )
-    rank_pattern: Optional[dict] = field(
-        default_factory=dict,
-        metadata={
-            "help": (
-                "The mapping from layer names or regexp expression to ranks which are different from the default rank specified by `r`. "
-                "For example, `{'^model.decoder.layers.0.encoder_attn.k_proj': 16}`."
-            )
-        },
-    )
-    scaling_pattern: Optional[dict] = field(
-        default_factory=dict,
-        metadata={
-            "help": (
-                "The mapping from layer names or regexp expression to alphas which are different from the default alpha specified by `lora_alpha`. "
-                "For example, `{'^model.decoder.layers.0.encoder_attn.k_proj': 16}`."
-            )
         },
     )
     trainable_token_indices: Optional[Union[list[int], dict[str, list[int]]]] = field(
