@@ -187,7 +187,6 @@ def train():
         print(model)
 
         dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
-        n_knowledge_samples = args.n_knowledge_samples * len(args.knowledge_dataset)
         path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
         preprocess_config = XXXPreprocessConfig(
             stiff_basis_path=f"{CACHE_ROOT}/stiff_basis/{path_name}",
