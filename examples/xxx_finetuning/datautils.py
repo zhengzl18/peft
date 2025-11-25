@@ -124,7 +124,7 @@ def get_knowledge_data(name, tokenizer, model_id, nsamples, seed=3):
         print("loaded ...")
         return knowledge_dataset
 
-    if name == "traivia_qa":
+    if name == "trivia_qa":
         traindata = load_dataset("trivia_qa", "rc", split="train").shuffle(seed=seed).take(nsamples)
         PROMPT = "Answer these questions:\n\n Q: {question}?\nAnswer:{answer}"
         input_texts = [
