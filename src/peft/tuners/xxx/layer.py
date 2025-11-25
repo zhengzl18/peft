@@ -36,15 +36,15 @@ class XXXLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names: tuple[str, ...] = ("xxx_delta_weight",)
     # All names of other parameters that may contain adapter-related parameters
-    other_param_names: tuple[str, ...] = ("xxx_jacobian_w", "xxx_jacobian_w_mask_indice", "xxx_jacobian_w_quant_state",)
+    other_param_names: tuple[str, ...] = ("xxx_stiff_basis_w", "xxx_stiff_basis_w_mask_indice", "xxx_stiff_basis_w_quant_state",)
 
     def __init__(self, base_layer: nn.Module, **kwargs) -> None:
         self.base_layer = base_layer
-        self.xxx_jacobian_w = nn.ModuleDict({})  # Currently there is no `BufferDict` in torch.nn, this is a workaround to ensure proper device handling
-        self.xxx_jacobian_w_mask_indice = nn.ModuleDict({})
+        self.xxx_stiff_basis_w = nn.ModuleDict({})  # Currently there is no `BufferDict` in torch.nn, this is a workaround to ensure proper device handling
+        self.xxx_stiff_basis_w_mask_indice = nn.ModuleDict({})
         self.xxx_delta_weight = nn.ParameterDict({})
-        self.xxx_jacobian_w_quant_state = {}
-        self.xxx_jacobian_w = nn.ModuleDict({})  # Currently there is no `BufferDict` in torch.nn, this is a workaround to ensure proper device handling
+        self.xxx_stiff_basis_w_quant_state = {}
+        self.xxx_stiff_basis_w = nn.ModuleDict({})  # Currently there is no `BufferDict` in torch.nn, this is a workaround to ensure proper device handling
         # Mark the weight as unmerged
         self._disable_adapters = False
         self.merged_adapters = []
@@ -61,7 +61,7 @@ class XXXLayer(BaseTunerLayer):
     def update_layer(
         self,
         adapter_name,
-        xxx_jacobian: Dict[str, torch.Tensor],
+        xxx_stiff_basis: Dict[str, torch.Tensor],
         inference_mode: bool = False,
         **kwargs,
     ):
@@ -69,12 +69,12 @@ class XXXLayer(BaseTunerLayer):
         kwargs = locals().copy()
         del kwargs["self"]
 
-        self.xxx_jacobian_w[adapter_name] = BufferWrapper(xxx_jacobian["weight"]["jac"])
-        mask = xxx_jacobian["weight"]["mask"]
+        self.xxx_stiff_basis_w[adapter_name] = BufferWrapper(xxx_stiff_basis["weight"]["stiff_basis"])
+        mask = xxx_stiff_basis["weight"]["mask"]
         indice = torch.stack([mask // self.in_features, mask % self.in_features])
-        self.xxx_jacobian_w_mask_indice[adapter_name] = BufferWrapper(indice)
-        # TODO: sanity check for shape of xxx_jacobian
-        self.xxx_jacobian_w_quant_state[adapter_name] = xxx_jacobian["weight"]["quant_state"]
+        self.xxx_stiff_basis_w_mask_indice[adapter_name] = BufferWrapper(indice)
+        # TODO: sanity check for shape of xxx_stiff_basis
+        self.xxx_stiff_basis_w_quant_state[adapter_name] = xxx_stiff_basis["weight"]["quant_state"]
 
         # Actual trainable parameters
         self.xxx_delta_weight[adapter_name] = nn.Parameter(torch.zeros(mask.shape[0]))
@@ -117,7 +117,7 @@ class Linear(nn.Module, XXXLayer):
         self,
         base_layer,
         adapter_name: str,
-        xxx_jacobian: Dict[str, torch.Tensor],
+        xxx_stiff_basis: Dict[str, torch.Tensor],
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
         **kwargs,
     ) -> None:
@@ -128,7 +128,7 @@ class Linear(nn.Module, XXXLayer):
         self._active_adapter = adapter_name
         self.update_layer(
             adapter_name,
-            xxx_jacobian=xxx_jacobian,
+            xxx_stiff_basis=xxx_stiff_basis,
         )
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
@@ -206,7 +206,7 @@ class Linear(nn.Module, XXXLayer):
         cast_to_fp32 = device.type == "cpu" and (dtype == torch.float16 or dtype == torch.bfloat16)
 
         delta_weight = self.xxx_delta_weight[adapter]
-        mask_indice = self.xxx_jacobian_w_mask_indice[adapter]()
+        mask_indice = self.xxx_stiff_basis_w_mask_indice[adapter]()
 
         if cast_to_fp32:
             delta_weight = delta_weight.float()
@@ -224,7 +224,7 @@ class Linear(nn.Module, XXXLayer):
 
             # cast back the weights
             self.xxx_delta_weight[adapter].data = delta_weight.to(dtype)
-            # TODO: check whether this is necessary, whether we should also cast back jacobian
+            # TODO: check whether this is necessary, whether we should also cast back stiff_basisobian
 
         return output_tensor
 
@@ -247,7 +247,7 @@ class Linear(nn.Module, XXXLayer):
                     continue
 
                 delta_weight = self.xxx_delta_weight[active_adapter]
-                mask_indice = self.xxx_jacobian_w_mask_indice[active_adapter]()
+                mask_indice = self.xxx_stiff_basis_w_mask_indice[active_adapter]()
                 x = self._cast_input_dtype(x, delta_weight.dtype)
                 delta_weight = torch.sparse_coo_tensor(
                     indices=mask_indice,

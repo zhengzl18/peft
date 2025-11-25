@@ -35,17 +35,18 @@ PROMPT = (
     "### Instruction:\n{instruction}\n\n### Response:"
 )
 
-CACHE_ROOT = "/home/fit/lishbo/WORK/data/zhengzhilong/anticf"  # peft/examples/corda_finetuning
+CACHE_ROOT = "/Data2/zhengzhilong"  # peft/examples/corda_finetuning
 
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     model_name_or_path: str = field(default=None)
     knowledge_dataset: list[str] = field(default=None)
-    n_knowledge_samples: int = field(default=None)
+    r_stiff_basis: int = field(default=None)
     n_param_downsample_rate: float = field(default=1.0)
     fwd_importance_sampling: bool = field(default=False)
     bwd_importance_sampling: bool = field(default=False)
+    quantize_stiff_basis: bool = field(default=True)
     seed: Optional[int] = field(default=42)
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
     dataset_split: str = field(default=None, metadata={"help": "(`['train', 'test', 'eval']`):"})
@@ -176,7 +177,7 @@ def train():
     args = parser.parse_args_into_dataclasses()[0]
     print(args)
 
-    if args.n_knowledge_samples is not None:
+    if args.r_stiff_basis is not None:
         print("Train in XXX mode")
         print("Loading base model...")
         model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -187,14 +188,14 @@ def train():
 
         dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
         n_knowledge_samples = args.n_knowledge_samples * len(args.knowledge_dataset)
-        path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+        path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
         preprocess_config = XXXPreprocessConfig(
-            jacobian_path=f"{CACHE_ROOT}/jacobian/{path_name}",
+            stiff_basis_path=f"{CACHE_ROOT}/stiff_basis/{path_name}",
             fwd_importance_sampling=args.fwd_importance_sampling,
             bwd_importance_sampling=args.bwd_importance_sampling,
+            quantize_stiff_basis=args.quantize_stiff_basis,
         )
         xxx_config = XXXConfig(
-            # target_modules=["q_proj", "o_proj", "k_proj", "v_proj",],
             target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
             task_type="CAUSAL_LM",
             preprocess_config=preprocess_config,

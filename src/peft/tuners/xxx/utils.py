@@ -18,6 +18,7 @@
 import os
 from collections.abc import Iterable
 from typing import Dict, List, Optional
+import warnings
 
 from peft.tuners.xxx.config import XXXConfig, XXXPreprocessConfig
 from peft.tuners.xxx.layer import XXXLayer
@@ -29,7 +30,7 @@ from peft.tuners.lora.config import LoraConfig
 from peft.tuners.lora.model import LoraModel
 from peft.utils.other import get_pattern_key
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
-from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise
+from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise, QuantState
 
 
 IMPORTANCE_SCORE_MODE = {
@@ -105,7 +106,6 @@ def get_param_downsample_mask(
 def preprocess_xxx(
     model: nn.Module,
     xxx_config: XXXConfig,
-    knowledge_data_loader: Optional[List[Dict[str, torch.Tensor]]] = None,
     local_rank: int = 0,
 ):
     """
@@ -121,38 +121,60 @@ def preprocess_xxx(
         xxx_config (`XXXConfig`):
             XXX configuration of the model. `preprocess_config` should be set.
     """
-    jacobian_path = xxx_config.preprocess_config.jacobian_path
-    assert jacobian_path is not None, "jacobian_path in preprocess_config should be specified for CorDA preprocessing."
-    os.makedirs(jacobian_path, exist_ok=True)
+    stiff_basis_path = xxx_config.preprocess_config.stiff_basis_path
+    assert stiff_basis_path is not None, "stiff_basis_path in preprocess_config should be specified for XXX preprocessing."
+    quantize_stiff_basis = xxx_config.preprocess_config.quantize_stiff_basis
+    if quantize_stiff_basis:
+        torch.serialization.add_safe_globals([QuantState])
+    fwd_importance_sampling = xxx_config.preprocess_config.fwd_importance_sampling
+    bwd_importance_sampling = xxx_config.preprocess_config.bwd_importance_sampling
+    
+    for module_name, module in target_modules(model, xxx_config):
+        module_stiff_basis = {}
+        for param_name, _ in target_params(model, xxx_config):
+            if not param_name.startswith(module_name):
+                continue
+            file_name = param_name.replace('.', '-')
+            if fwd_importance_sampling:
+                file_name += "_fwd"
+            if bwd_importance_sampling:
+                file_name += "_bwd"
+            
+            if not os.path.exists(f"{stiff_basis_path}/{file_name}.pt"):
+                raise FileNotFoundError(f"Stiff basis file for {param_name} not found in {stiff_basis_path}, run preprocess.py to build stiff basis first.")
 
-    try:
-        load_jacobian(model, xxx_config, local_rank)
-    except FileNotFoundError as e:
-        print(e)
-
-        # Calculate jacobian matrix
-        calculate_jacobian(
-            model, 
-            knowledge_data_loader, 
-            xxx_config, 
-            jacobian_path,
-        )
-
-        load_jacobian(model, xxx_config, local_rank)
+            print(f"Loading stiff basis from {stiff_basis_path}/{file_name}.pt on cuda:{local_rank} ...")
+            stiff_basis = torch.load(f"{stiff_basis_path}/{file_name}.pt", map_location=f"cuda:{local_rank}")
+            
+            if quantize_stiff_basis:
+                assert "quant_state" in stiff_basis, "quantize_stiff_basis is True but quant_state not found in the loaded stiff basis."
+            else:
+                assert "quant_state" not in stiff_basis, "quantize_stiff_basis is False but quant_state found in the loaded stiff basis."
+                stiff_basis['stiff_basis'] = stiff_basis['stiff_basis'].to(model.dtype)
+            # items = [(k, v) for k, v in stiff_basis.items()]
+            # for k, v in items:
+            #     if "mask" not in k:
+            #         jac[k] = quantized_jac
+            #         jac["quant_state"] = quant_state
+            #     else:
+            #         stiff_basis[k] = v
+            module_stiff_basis[param_name.split('.')[-1]] = stiff_basis
+        module.xxx_stiff_basis = module_stiff_basis
 
 def calculate_jacobian(
     model: nn.Module,
-    data_loader: List[Dict[str, torch.Tensor]],
     config: XXXConfig,
-    save_path: str,
+    data_loader: List[Dict[str, torch.Tensor]],
     mask_path: Optional[str] = None,
 ):
+    save_path = config.preprocess_config.jacobian_path
+    assert isinstance(save_path, str), f"jacobian_path in preprocess_config is expected to be a string for calculating and saving jacobians, got {type(config.jacobian_path)}."
     n_param_downsample_rate = config.preprocess_config.n_param_downsample_rate
     fwd_importance_sampling = config.preprocess_config.fwd_importance_sampling
     bwd_importance_sampling = config.preprocess_config.bwd_importance_sampling
     fwd_importance_score_path = config.preprocess_config.fwd_importance_score_path
     bwd_importance_score_path = config.preprocess_config.bwd_importance_score_path
-    
+
     model.train()
     os.makedirs(save_path, exist_ok=True)
     for name, p in target_params(model, config):
@@ -165,10 +187,10 @@ def calculate_jacobian(
             file_name += f"_bwd"
 
         if os.path.exists(f"{save_path}/{file_name}.pt"):
-            print(f"Jacobian file for {name} already exists, skipping.")
+            print(f"Jacobian file for {save_path}/{name} already exists, skipping.")
             continue
         
-        print(f"Calculating jacobian for {name} ...")
+        print(f"Calculating jacobian for {save_path}/{name} ...")
         for param in model.parameters():
             param.requires_grad = False
         grads = []
@@ -200,6 +222,72 @@ def calculate_jacobian(
         # stack grads into jacobian matrix
         jac = torch.stack(grads, dim=0)
         torch.save(dict(jac=jac, mask=mask), f"{save_path}/{file_name}.pt")
+
+@torch.no_grad()
+def calculate_stiff_basis(
+    model: nn.Module,
+    config: XXXConfig,
+):
+    jacobian_paths = config.preprocess_config.jacobian_path
+    assert isinstance(jacobian_paths, List), \
+        f"jacobian_path in preprocess_config is expected to be a List[str] for calculating and saving stiff basis, got {type(jacobian_paths)}."
+    save_path = config.preprocess_config.stiff_basis_path
+    assert save_path is not None, \
+        "stiff_basis_path in preprocess_config should be specified for calculating and saving stiff basis."
+    r_stiff_basis = config.preprocess_config.r_stiff_basis
+    assert r_stiff_basis is not None, \
+        "r_stiff_basis in preprocess_config should be specified for calculating and saving stiff basis."
+    fwd_importance_sampling = config.preprocess_config.fwd_importance_sampling
+    bwd_importance_sampling = config.preprocess_config.bwd_importance_sampling
+    quantize_stiff_basis = config.preprocess_config.quantize_stiff_basis
+
+    os.makedirs(save_path, exist_ok=True)
+    for name, p in target_params(model, config):
+        assert len(p.shape) <= 2
+        assert '-' not in name
+        file_name = name.replace('.', '-')
+        if fwd_importance_sampling:
+            file_name += f"_fwd"
+        if bwd_importance_sampling:
+            file_name += f"_bwd"
+
+        if os.path.exists(f"{save_path}/{file_name}.pt"):
+            print(f"Stiff basis file for {save_path}/{name} already exists, skipping.")
+            continue
+
+        print(f"Calculating stiff basis for {name} ...")
+
+        full_jacobian = []
+        mask = None
+        for jacobian_path in jacobian_paths:
+            if not os.path.exists(f"{jacobian_path}/{file_name}.pt"):
+                raise FileNotFoundError(f"Jacobian file for {name} not found in {jacobian_path}, cannot calculate stiff basis.")
+
+            jac = torch.load(f"{jacobian_path}/{file_name}.pt", map_location=get_model_device(model))
+            if mask is None:
+                mask = jac['mask']
+            else:
+                assert torch.equal(mask, jac['mask']), "Masks from different jacobian files do not match."
+            full_jacobian.append(jac['jac'])
+        full_jacobian = torch.cat(full_jacobian, dim=0).to(torch.float32)
+            
+        if full_jacobian.shape[0] < r_stiff_basis:
+            warnings.warn(
+                f"r_stiff_basis {r_stiff_basis} is larger than the total number of knowledge dataset samples {full_jacobian.shape[0]} "
+                f"for parameter {name}. Setting r_stiff_basis to {full_jacobian.shape[0]}."
+            )
+            stiff_basis, _ = torch.linalg.qr(full_jacobian.T)
+        elif full_jacobian.shape[0] == r_stiff_basis:
+            stiff_basis, _ = torch.linalg.qr(full_jacobian.T)
+        else:
+            U, _, _ = torch.linalg.svd(full_jacobian.T, full_matrices=False)
+            stiff_basis = U[:, :r_stiff_basis]
+        
+        if quantize_stiff_basis:
+            quantized_stiff_basis, quant_state = quantize_blockwise(stiff_basis)
+            torch.save(dict(stiff_basis=quantized_stiff_basis, quant_state=quant_state, mask=mask), f"{save_path}/{file_name}.pt")
+        else:
+            torch.save(dict(stiff_basis=stiff_basis, mask=mask), f"{save_path}/{file_name}.pt")
 
 def calculate_importance_score(
     model: nn.Module,
@@ -241,45 +329,6 @@ def calculate_importance_score(
             assert '-' not in name
             torch.save(grad[name], f"{save_path}/{name.replace('.', '-')}.pt")
 
-def load_jacobian(
-    model: nn.Module,
-    config: XXXConfig,
-    local_rank: int = 0,
-):
-    """Load jacobian matrices from disk and store result in key `xxx_jacobian` of each layer."""
-    
-    jacobian_path = config.preprocess_config.jacobian_path
-    fwd_importance_sampling = config.preprocess_config.fwd_importance_sampling
-    bwd_importance_sampling = config.preprocess_config.bwd_importance_sampling
-    
-    for module_name, module in target_modules(model, config):
-        jacobian = {}
-        for param_name, _ in target_params(model, config):
-            if not param_name.startswith(module_name):
-                continue
-            file_name = param_name.replace('.', '-')
-            if fwd_importance_sampling:
-                file_name += "_fwd"
-            if bwd_importance_sampling:
-                file_name += "_bwd"
-            
-            if not os.path.exists(f"{jacobian_path}/{file_name}.pt"):
-                raise FileNotFoundError(f"Jacobian file for {param_name} not found in {jacobian_path}, rebuilding all.")
-
-            print(f"Loading jacobian from {jacobian_path}/{file_name}.pt on cuda:{local_rank} ...")
-            jac = torch.load(f"{jacobian_path}/{file_name}.pt", map_location=f"cuda:{local_rank}")
-            items = [(k, v) for k, v in jac.items()]
-            for k, v in items:
-                if "mask" not in k:
-                    normalized_jac, _ = torch.linalg.qr(jac[k][:64].T)
-                    quantized_jac, quant_state = quantize_blockwise(normalized_jac)
-                    jac[k] = quantized_jac
-                    jac["quant_state"] = quant_state
-                else:
-                    jac[k] = v
-            jacobian[param_name.split('.')[-1]] = jac
-        module.xxx_jacobian = jacobian
-
 
 class ProjectionCallback(TrainerCallback):
     """
@@ -291,10 +340,10 @@ class ProjectionCallback(TrainerCallback):
         for _, module in model.named_modules():
             if isinstance(module, XXXLayer):
                 delta_weight = module.xxx_delta_weight[model.active_adapter]
-                jacobian = module.xxx_jacobian_w[model.active_adapter]()
-                quant_state = module.xxx_jacobian_w_quant_state[model.active_adapter]
-                jacobian = dequantize_blockwise(jacobian, quant_state)
+                stiff_basis = module.xxx_stiff_basis_w[model.active_adapter]()
+                quant_state = module.xxx_stiff_basis_w_quant_state[model.active_adapter]
+                stiff_basis = dequantize_blockwise(stiff_basis, quant_state)
                 # print("\nnorm before projection:", delta_weight.data.norm().item())
-                delta_weight.data = delta_weight.data - delta_weight.data @ jacobian @ jacobian.T
+                delta_weight.data = delta_weight.data - delta_weight.data @ stiff_basis @ stiff_basis.T
                 # print("norm after projection:", delta_weight.data.norm().item())
         return control

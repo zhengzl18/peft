@@ -56,12 +56,12 @@ class XXXModel(BaseTuner):
                     "one LoRA adapter per model with `target_parameters` is allowed."
                 )
 
-        assert hasattr(target, "xxx_jacobian"), f"Jacobian has not been initialized for {target}. Please run preprocess_xxx first."
-        xxx_jacobian = target.xxx_jacobian
-        del target.xxx_jacobian
+        assert hasattr(target, "xxx_stiff_basis"), f"Jacobian has not been initialized for {target}. Please run preprocess_xxx first."
+        xxx_stiff_basis = target.xxx_stiff_basis
+        del target.xxx_stiff_basis
 
         kwargs = {
-            "xxx_jacobian": xxx_jacobian,
+            "xxx_stiff_basis": xxx_stiff_basis,
             "fan_in_fan_out": xxx_config.fan_in_fan_out,
         }
 
@@ -69,7 +69,7 @@ class XXXModel(BaseTuner):
         if isinstance(target, XXXLayer):
             target.update_layer(
                 adapter_name,
-                xxx_jacobian=xxx_jacobian,
+                xxx_stiff_basis=xxx_stiff_basis,
                 inference_mode=xxx_config.inference_mode,
             )
         else:

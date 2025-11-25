@@ -14,7 +14,7 @@
 
 import argparse
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import numpy as np
@@ -23,10 +23,8 @@ from datautils import get_knowledge_data
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from peft import get_peft_model
-from peft.tuners.lora.config import LoraConfig
 from peft.tuners.xxx.config import XXXConfig, XXXPreprocessConfig
-from peft.tuners.xxx.utils import preprocess_xxx, calculate_importance_score
+from peft.tuners.xxx.utils import calculate_jacobian, calculate_stiff_basis, calculate_importance_score
 
 CACHE_ROOT = "/Data2/zhengzhilong"  # peft/examples/corda_finetuning
 
@@ -65,36 +63,18 @@ def main(args):
     model_id = args.model_id
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, device_map="auto")
-
-    # Collect data
-    knowledge_data_loader = get_knowledge_data(
-        name=args.knowledge_dataset, 
-        tokenizer=tokenizer, 
-        model_id=model_id, 
-        nsamples=args.n_knowledge_samples, 
-        seed=args.seed
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, 
+        dtype=torch.bfloat16,
+        device_map="auto"
     )
-    task_data_loader = None
-    if args.fwd_importance_sampling:
-        task_data_loader = get_knowledge_data(
-            name=args.task_dataset, 
-            tokenizer=tokenizer, 
-            model_id=model_id, 
-            nsamples=args.n_task_samples, 
-            seed=args.seed
-        )
 
-    # Evaluate the original model
-    print("\n---- model before svd ---\n")
-    print(model)
-
-    dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
-    n_knowledge_samples = args.n_knowledge_samples * len(args.knowledge_dataset)
-    path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_{n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+    mask_path = None
+    jacobian_paths = []
+    # Get the shared part of preprocess config and xxx config
     preprocess_config = XXXPreprocessConfig(
-        jacobian_path=f"{CACHE_ROOT}/jacobian/{path_name}",
         n_param_downsample_rate=args.n_param_downsample_rate,
+        quantize_stiff_basis=args.quantize_stiff_basis,
     )
     if args.fwd_importance_sampling:
         preprocess_config.fwd_importance_sampling = True
@@ -102,39 +82,76 @@ def main(args):
     if args.bwd_importance_sampling:
         preprocess_config.bwd_importance_sampling = True
         preprocess_config.bwd_importance_score_path = f"{CACHE_ROOT}/bwd_importance_score/{path_name}"
+    xxx_config = XXXConfig(target_modules=args.target_modules,)
     
-    xxx_config = XXXConfig(
-        target_modules=args.target_modules,
-        preprocess_config=preprocess_config,
-    )
-    if args.fwd_importance_sampling:
-        calculate_importance_score(
-            model,
-            task_data_loader,
-            xxx_config,
-            mode="abs",
-            save_path=preprocess_config.fwd_importance_score_path,
+    for dataset_name in args.knowledge_dataset:
+        # Collect data
+        knowledge_data_loader = get_knowledge_data(
+            name=dataset_name, 
+            tokenizer=tokenizer, 
+            model_id=model_id, 
+            nsamples=args.n_knowledge_samples, 
+            seed=args.seed
         )
-    if args.bwd_importance_sampling:
-        calculate_importance_score(
-            model,
-            knowledge_data_loader,
-            xxx_config,
-            mode="abs",
-            save_path=preprocess_config.bwd_importance_score_path,
-        )
+        task_data_loader = None
+        if args.fwd_importance_sampling:
+            task_data_loader = get_knowledge_data(
+                name=args.task_dataset, 
+                tokenizer=tokenizer, 
+                model_id=model_id, 
+                nsamples=args.n_task_samples, 
+                seed=args.seed
+            )
 
-    preprocess_xxx(
+        dataset_name = dataset_name.replace("/", "_")
+        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_{args.n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+        preprocess_config.jacobian_path = f"{CACHE_ROOT}/jacobian/{path_name}"
+        xxx_config.preprocess_config = preprocess_config
+
+        if args.fwd_importance_sampling:
+            calculate_importance_score(
+                model,
+                task_data_loader,
+                xxx_config,
+                mode="abs",
+                save_path=preprocess_config.fwd_importance_score_path,
+            )
+        if args.bwd_importance_sampling:
+            calculate_importance_score(
+                model,
+                knowledge_data_loader,
+                xxx_config,
+                mode="abs",
+                save_path=preprocess_config.bwd_importance_score_path,
+            )
+
+        # preprocess_xxx(
+        #     model,
+        #     xxx_config,
+        #     knowledge_data_loader=knowledge_data_loader,
+        #     task_data_loader=task_data_loader
+        # )
+        calculate_jacobian(
+            model, 
+            xxx_config, 
+            data_loader=knowledge_data_loader, 
+            mask_path=mask_path,
+        )
+        if mask_path is None:
+            # Use the first dataset to generate the mask
+            mask_path = preprocess_config.jacobian_path
+        jacobian_paths.append(preprocess_config.jacobian_path)
+    
+    dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
+    path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+    preprocess_config.jacobian_path = jacobian_paths
+    preprocess_config.stiff_basis_path = f"{CACHE_ROOT}/stiff_basis/{path_name}"
+    preprocess_config.r_stiff_basis = args.r_stiff_basis
+    xxx_config.preprocess_config = preprocess_config
+    calculate_stiff_basis(
         model,
         xxx_config,
-        knowledge_data_loader=knowledge_data_loader,
-        task_data_loader=task_data_loader
     )
-    model = get_peft_model(model, xxx_config)
-
-    # Evaluate again to check if the model is consistent
-    # Using `model.model` here because `get_peft_model` wraps a layer to the model
-    print(model)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -148,7 +165,7 @@ if __name__ == "__main__":
         "--target_modules",
         type=str,
         nargs="+",
-        default=["gate_proj",],
+        default=["k_proj","up_proj","v_proj","o_proj","q_proj","gate_proj","down_proj"],
         help="Pretrained model ID",
     )
     parser.add_argument(
@@ -161,7 +178,7 @@ if __name__ == "__main__":
         "--knowledge_dataset",
         type=str,
         nargs="+",
-        default=["nqopen",],
+        default=["nqopen","trivia_qa"],
         choices=[],
         help="knowledge dataset",
     )
@@ -169,6 +186,11 @@ if __name__ == "__main__":
         "--n_param_downsample_rate",
         type=float,
         default=0.01,
+    )
+    parser.add_argument(
+        "--r_stiff_basis",
+        type=int,
+        default=128,
     )
     parser.add_argument(
         "--fwd_importance_sampling",
@@ -179,6 +201,11 @@ if __name__ == "__main__":
         "--bwd_importance_sampling",
         type=bool,
         default=False,
+    )
+    parser.add_argument(
+        "--quantize_stiff_basis",
+        type=bool,
+        default=True,
     )
     parser.add_argument(
         "--seed",

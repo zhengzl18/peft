@@ -14,11 +14,8 @@
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Union
-
-from torch import nn
+from typing import Optional, Union, List
 
 from peft.config import PeftConfig
 from peft.utils import PeftType
@@ -35,7 +32,8 @@ class XXXPreprocessConfig:
         quantize_jacobian (`bool`):
             If true, quantizes the jacobian matrix to int8. This can reduce the memory usage of the jacobian matrix by 4x.
     """
-    jacobian_path: str = field(
+    jacobian_path: Optional[Union[str, List[str]]] = field(
+        default=None,
         metadata={
             "help": (
                 "File to store the jacobian matrix. If you wish to train multiple models with different ranks, but "
@@ -43,6 +41,19 @@ class XXXPreprocessConfig:
                 "Note that jacobian file is usually large (comparable to model size), so you will need sufficient storage."
             )
         },
+    )
+    stiff_basis_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "File to store the stiff basis matrix. If you wish to train multiple models with different ranks, but "
+                "they sample from the same dataset, you can store the stiff basis matrix and reuse it for different ranks. "
+                "Note that stiff basis file is usually large (comparable to model size), so you will need sufficient storage."
+            )
+        },
+    )
+    r_stiff_basis: Optional[int] = field(
+        default=None,
     )
     n_param_downsample_rate: float = field(
         default=1.0,
@@ -60,11 +71,11 @@ class XXXPreprocessConfig:
         default=None,
     )
     verbose: bool = field(default=False, metadata={"help": "If true, prints the progress of CorDA initialization."})
-    quantize_jacobian: bool = field(
+    quantize_stiff_basis: bool = field(
         default=True,
         metadata={
             "help": (
-                "If true, quantizes the jacobian matrix to int8. This can reduce the memory usage of the jacobian matrix by 4x."
+                "If true, quantizes the stiff basis matrix to int8. This can reduce the memory usage of the stiff basis matrix by 4x."
             )
         },
     )
