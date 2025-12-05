@@ -125,11 +125,11 @@ def get_knowledge_data(name, tokenizer, model_id, nsamples, seed=3):
         return knowledge_dataset
 
     if name == "trivia_qa":
-        traindata = load_dataset("trivia_qa", "rc", split="train").shuffle(seed=seed).take(nsamples)
+        traindata = load_dataset("trivia_qa", "rc.nocontext", split="train").shuffle(seed=seed).take(nsamples)
         PROMPT = "Answer these questions:\n\n Q: {question}?\nAnswer:{answer}"
         input_texts = [
-            PROMPT.format(question=q, answer=a)
-            for q, a in zip(traindata["question"], traindata["answer"])
+            PROMPT.format(question=q, answer=a[0])
+            for q, a in zip(traindata["question"], traindata["answer"]["aliases"])
         ]
     elif name == "nqopen":
         traindata = load_dataset("nq_open", split="train").shuffle(seed=seed).take(nsamples)
