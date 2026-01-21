@@ -142,10 +142,15 @@ def main(args):
         jacobian_paths.append(preprocess_config.jacobian_path)
     
     dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
-    path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+    if args.adaptive_r_stiff_basis:
+        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_adaptive_r{args.r_stiff_basis}_thres{args.cumulative_energy_threshold}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+    else:
+        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
     preprocess_config.jacobian_path = jacobian_paths
     preprocess_config.stiff_basis_path = f"{CACHE_ROOT}/stiff_basis/{path_name}"
     preprocess_config.r_stiff_basis = args.r_stiff_basis
+    preprocess_config.adaptive_r_stiff_basis = args.adaptive_r_stiff_basis
+    preprocess_config.cumulative_energy_threshold = args.cumulative_energy_threshold
     xxx_config.preprocess_config = preprocess_config
     calculate_stiff_basis(
         model,
@@ -177,19 +182,34 @@ if __name__ == "__main__":
         "--knowledge_dataset",
         type=str,
         nargs="+",
-        default=["nqopen","trivia_qa"],
+        default=["nqopen",],
         choices=[],
         help="knowledge dataset",
     )
     parser.add_argument(
         "--n_param_downsample_rate",
         type=float,
-        default=0.01,
+        default=0.02,
     )
     parser.add_argument(
         "--r_stiff_basis",
         type=int,
-        default=128,
+        default=256,
+    )
+    parser.add_argument(
+        "--adaptive_r_stiff_basis",
+        type=bool,
+        default=False,
+    )
+    parser.add_argument(
+        "--cumulative_energy_threshold",
+        type=float,
+        default=0.8,
+    )
+    parser.add_argument(
+        "--min_r_stiff_basis",
+        type=int,
+        default=1,
     )
     parser.add_argument(
         "--fwd_importance_sampling",

@@ -250,3 +250,8 @@ def get_eval_loaders(name, tokenizer):
         testenc = tokenizer("\n\n".join(testdata["text"]), return_tensors="pt")
         return testenc
     raise NotImplementedError
+
+
+if __name__ == "__main__":
+    traindata = load_dataset("fxmeng/pissa-dataset", data_dir="conversation", split="train")
+    print("here")

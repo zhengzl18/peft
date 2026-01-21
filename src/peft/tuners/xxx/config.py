@@ -55,6 +55,15 @@ class XXXPreprocessConfig:
     r_stiff_basis: Optional[int] = field(
         default=None,
     )
+    adaptive_r_stiff_basis: bool = field(
+        default=False,
+    )
+    cumulative_energy_threshold: float = field(
+        default=0.9,
+    )
+    min_r_stiff_basis: int = field(
+        default=1,
+    )
     n_param_downsample_rate: float = field(
         default=1.0,
     )

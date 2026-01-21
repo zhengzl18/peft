@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import json
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from collections.abc import Sequence
@@ -46,6 +47,8 @@ class TrainingArguments(transformers.TrainingArguments):
     model_name_or_path: str = field(default="meta-llama/Llama-2-7b-hf")
     knowledge_dataset: list[str] = field(default_factory=lambda: ["nqopen", "trivia_qa"])
     r_stiff_basis: int = field(default=128)
+    adaptive_r_stiff_basis: bool = field(default=False)
+    cumulative_energy_threshold: float = field(default=0.9)
     n_param_downsample_rate: float = field(default=0.01)
     fwd_importance_sampling: bool = field(default=False)
     bwd_importance_sampling: bool = field(default=False)
@@ -175,7 +178,16 @@ def get_nb_trainable_parameters(model) -> tuple[int, int]:
 def train():
     parser = transformers.HfArgumentParser(TrainingArguments)
     args = parser.parse_args_into_dataclasses()[0]
-    print(args)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(f"{args.output_dir}/training_config.json", "w") as f:
+        def set_default(obj):
+            try:
+                return str(obj)
+            except Exception:
+                return f"__Unserializable_Object_of_Type_{type(obj).__name__}__"
+        json.dump(vars(args), f, indent=4, default=set_default)
+
 
     if args.r_stiff_basis is not None:
         print("Train in XXX mode")
@@ -187,7 +199,10 @@ def train():
         )
         
         dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
-        path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+        if args.adaptive_r_stiff_basis:
+            path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_adaptive_r{args.r_stiff_basis}_thres{args.cumulative_energy_threshold}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+        else:
+            path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
         preprocess_config = XXXPreprocessConfig(
             stiff_basis_path=f"{CACHE_ROOT}/stiff_basis/{path_name}",
             fwd_importance_sampling=args.fwd_importance_sampling,

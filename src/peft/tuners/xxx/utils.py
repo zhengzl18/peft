@@ -235,6 +235,11 @@ def calculate_stiff_basis(
     assert save_path is not None, \
         "stiff_basis_path in preprocess_config should be specified for calculating and saving stiff basis."
     r_stiff_basis = config.preprocess_config.r_stiff_basis
+    adaptive_r_stiff_basis = config.preprocess_config.adaptive_r_stiff_basis
+    if adaptive_r_stiff_basis:
+        cumulative_energy_threshold = config.preprocess_config.cumulative_energy_threshold
+        min_r_stiff_basis = config.preprocess_config.min_r_stiff_basis
+
     assert r_stiff_basis is not None, \
         "r_stiff_basis in preprocess_config should be specified for calculating and saving stiff basis."
     fwd_importance_sampling = config.preprocess_config.fwd_importance_sampling
@@ -273,15 +278,15 @@ def calculate_stiff_basis(
             
         if full_jacobian.shape[0] < r_stiff_basis:
             warnings.warn(
-                f"r_stiff_basis {r_stiff_basis} is larger than the total number of knowledge dataset samples {full_jacobian.shape[0]} "
-                f"for parameter {name}. Setting r_stiff_basis to {full_jacobian.shape[0]}."
+                f"r_stiff_basis {r_stiff_basis} is larger than the total number of knowledge dataset samples {full_jacobian.shape[0]} for parameter {name}."
             )
-            stiff_basis, _ = torch.linalg.qr(full_jacobian.T)
-        elif full_jacobian.shape[0] == r_stiff_basis:
-            stiff_basis, _ = torch.linalg.qr(full_jacobian.T)
-        else:
-            U, _, _ = torch.linalg.svd(full_jacobian.T, full_matrices=False)
-            stiff_basis = U[:, :r_stiff_basis]
+        U, S, _ = torch.linalg.svd(full_jacobian.T, full_matrices=False)
+        if adaptive_r_stiff_basis:
+            max_r_stiff_basis = r_stiff_basis
+            cumulative_energy = torch.cumsum(S ** 2, dim=0) / torch.sum(S ** 2)
+            r_stiff_basis = (torch.searchsorted(cumulative_energy, cumulative_energy_threshold) + 1).clip(min_r_stiff_basis, max_r_stiff_basis)
+            print(f"Adjusted r_stiff_basis to {r_stiff_basis} for parameter {name} based on energy threshold {cumulative_energy_threshold}.")
+        stiff_basis = U[:, :r_stiff_basis]
         
         if quantize_stiff_basis:
             quantized_stiff_basis, quant_state = quantize_blockwise(stiff_basis)
@@ -344,6 +349,7 @@ class ProjectionCallback(TrainerCallback):
                 quant_state = module.xxx_stiff_basis_w_quant_state[model.active_adapter]
                 stiff_basis = dequantize_blockwise(stiff_basis, quant_state)
                 # print("\nnorm before projection:", delta_weight.data.norm().item())
+                # print(torch.isfinite(delta_weight).all())
                 delta_weight.data = delta_weight.data - delta_weight.data @ stiff_basis @ stiff_basis.T
                 # print("norm after projection:", delta_weight.data.norm().item())
         return control
