@@ -21,4 +21,4 @@ from .model import XXXModel
 
 __all__ = ["Linear", "XXXConfig", "XXXPreprocessConfig", "XXXLayer", "XXXModel"]
 
-register_peft_method(name="xxx", config_cls=XXXConfig, model_cls=XXXModel, prefix="xxx_")
+register_peft_method(name="xxx", config_cls=XXXConfig, model_cls=XXXModel, prefix="lora_")

@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional, Union, List
 
-from peft.config import PeftConfig
+from peft.tuners.lora.config import LoraConfig
 from peft.utils import PeftType
 
 
@@ -64,21 +64,6 @@ class XXXPreprocessConfig:
     min_r_stiff_basis: int = field(
         default=1,
     )
-    n_param_downsample_rate: float = field(
-        default=1.0,
-    )
-    fwd_importance_sampling: bool = field(
-        default=False,
-    )
-    fwd_importance_score_path: Optional[str] = field(
-        default=None,
-    )
-    bwd_importance_sampling: bool = field(
-        default=False,
-    )
-    bwd_importance_score_path: Optional[str] = field(
-        default=None,
-    )
     verbose: bool = field(default=False, metadata={"help": "If true, prints the progress of CorDA initialization."})
     quantize_stiff_basis: bool = field(
         default=True,
@@ -91,116 +76,27 @@ class XXXPreprocessConfig:
 
 
 @dataclass
-class XXXConfig(PeftConfig):
-    target_modules: Optional[Union[list[str], str]] = field(
-        default=None,
-        metadata={
-            "help": (
-                "List of module names or regex expression of the module names to replace with LoRA. "
-                "For example, ['q', 'v'] or '.*decoder.*(SelfAttention|EncDecAttention).*(q|v)$'. "
-                "This can also be a wildcard 'all-linear' which matches all linear/Conv1D "
-                "(if the model is a PreTrainedModel, the output layer excluded). "
-                "If not specified, modules will be chosen according to the model architecture, If the architecture is "
-                "not known, an error will be raised -- in this case, you should specify the target modules manually. "
-                "To avoid targeting any modules (because you want to apply `target_parameters`), set "
-                "`target_modules=[]`."
-            ),
-        },
-    )
-    exclude_modules: Optional[Union[list[str], str]] = field(
-        default=None,
-        metadata={"help": "List of module names or regex expression of the module names to exclude from Lora."},
-    )
-    fan_in_fan_out: bool = field(
-        default=False,
-        metadata={"help": "Set this to True if the layer to replace stores weight like (fan_in, fan_out)"},
-    )
-    modules_to_save: Optional[list[str]] = field(
-        default=None,
-        metadata={
-            "help": "List of modules apart from LoRA layers to be set as trainable and saved in the final checkpoint. "
-            "For example, in Sequence Classification or Token Classification tasks, "
-            "the final layer `classifier/score` are randomly initialized and as such need to be trainable and saved."
-        },
-    )
-    layers_to_transform: Optional[Union[list[int], int]] = field(
-        default=None,
-        metadata={
-            "help": "The layer indexes to transform, is this argument is specified, PEFT will transform only the layers indexes that are specified inside this list. If a single integer is passed, PEFT will transform only the layer at this index. "
-            "This only works when target_modules is a list of str."
-        },
-    )
-    layers_pattern: Optional[Union[list[str], str]] = field(
-        default=None,
-        metadata={
-            "help": "The layer pattern name, used only if `layers_to_transform` is different to None and if the layer pattern is not in the common layers pattern."
-            "This only works when target_modules is a list of str. This should target the `nn.ModuleList` of the "
-            "model, which is often called `'layers'` or `'h'`."
-        },
-    )
-    trainable_token_indices: Optional[Union[list[int], dict[str, list[int]]]] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Lets you specify which token indices to selectively fine-tune without requiring to re-train the "
-                "whole embedding matrix using the `peft.TrainableTokensModel` method. You can specify token indices "
-                "in two ways. Either you specify a list of indices which will then target the model's input embedding "
-                "layer (or, if not found, `embed_tokens`). Alternatively, you can specify a dictionary where the key "
-                "is the name of the embedding module and the values are the list of token indices, e.g. "
-                "`{'embed_tokens': [0, 1, ...]}`. Note that training with FSDP requires `use_orig_params=True` to "
-                "avoid issues with non-uniform `requires_grad`."
-            )
-        },
-    )
-    target_parameters: Optional[list[str]] = field(
-        default=None,
-        metadata={
-            "help": (
-                "List of parameter names or regex expression of the parameter names to replace with LoRA. "
-                "This argument behaves similarly to `target_modules`, except that the parameter name should be passed. "
-                "Generally, you should use `target_modules` to target the module (e.g. `nn.Linear`). However, in some "
-                "circumstances, this is not possible. E.g., in many mixture of expert (MoE) layers in HF Transformers, "
-                "instead of using `nn.Linear`, an `nn.Parameter` is used. PEFT normally overwrites the `forward` "
-                "method for LoRA, but for `nn.Parameter`, there is none. Therefore, to apply LoRA to that parameter, "
-                "it needs to be targeted with `target_parameters`. As an example, for Llama4, you can pass: "
-                "`target_parameters=['feed_forward.experts.gate_up_proj', 'feed_forward.experts.down_proj]`. Passing a "
-                "string for regex matching is not implemented yet."
-            )
-        },
-    )
+class XXXConfig(LoraConfig):
     preprocess_config: Optional[XXXPreprocessConfig] = field(
         default=None,
         metadata={"help": "The CorDA preprocessing configuration."},
     )
+    
+    # TODO: maybe override LoraConfig's init_lora_weights param
 
-    def to_dict(self):
-        """
-        Returns the configuration for your adapter model as a dictionary. Removes runtime configurations.
-        """
-        rv = super().to_dict()
-        # rv.pop("runtime_config")
-        return rv
+    # def to_dict(self):
+    #     """
+    #     Returns the configuration for your adapter model as a dictionary. Removes runtime configurations.
+    #     """
+    #     rv = super().to_dict()
+    #     # rv.pop("runtime_config")
+    #     return rv
 
     def __post_init__(self):
         super().__post_init__()
         self.peft_type = PeftType.XXX
-        self.target_modules = (
-            set(self.target_modules) if isinstance(self.target_modules, list) else self.target_modules
-        )
-        self.exclude_modules = (
-            set(self.exclude_modules) if isinstance(self.exclude_modules, list) else self.exclude_modules
-        )
-        if isinstance(self.target_parameters, str):
-            raise TypeError("`target_parameters` must be a list of strings or None.")
-
-        # if target_modules is a regex expression, then layers_to_transform should be None
-        if isinstance(self.target_modules, str) and self.layers_to_transform is not None:
-            raise ValueError("`layers_to_transform` cannot be used when `target_modules` is a str.")
-
-        # if target_modules is a regex expression, then layers_pattern should be None
-        if isinstance(self.target_modules, str) and self.layers_pattern is not None:
-            raise ValueError("`layers_pattern` cannot be used when `target_modules` is a str.")
-
-        # check for layers_to_transform and layers_pattern
-        if self.layers_pattern and not self.layers_to_transform:
-            raise ValueError("When `layers_pattern` is specified, `layers_to_transform` must also be specified. ")
+        assert self.init_lora_weights == "orthogonal", "XXX only supports 'orthogonal' initialization for LoRA weights."
+        assert self.use_dora is False, "XXX does not support DoRA."
+        assert self.use_rslora is False, "XXX does not support RS-LoRA."
+        assert self.use_qalora is False, "XXX does not support QALoRA."
+        assert self.arrow_config is None, "XXX does not support ArrowLinearVariant."

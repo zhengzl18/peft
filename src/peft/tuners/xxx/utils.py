@@ -20,14 +20,17 @@ from collections.abc import Iterable
 from typing import Dict, List, Optional
 import warnings
 
+from peft.peft_model import PeftModel, PeftModelForCausalLM
 from peft.tuners.xxx.config import XXXConfig, XXXPreprocessConfig
 from peft.tuners.xxx.layer import XXXLayer
 import torch
 import torch.nn as nn
+from torch.nn import Linear
 from tqdm import tqdm
 
 from peft.tuners.lora.config import LoraConfig
 from peft.tuners.lora.model import LoraModel
+from peft.tuners.lora.layer import Linear as LoraLinear
 from peft.utils.other import get_pattern_key
 from transformers import TrainerCallback, TrainerControl, TrainerState, TrainingArguments
 from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise, QuantState
@@ -45,63 +48,24 @@ def target_modules(model: nn.Module, config: XXXConfig) -> Iterable[nn.Module]:
     Iterate over CorDA target name and modules of a model. A module is a target if its name is in
     `config.target_modules` and is `nn.Linear`.
     """
+    if isinstance(model, PeftModel):
+        model = model.get_base_model()
     for name, module in model.named_modules():
         # todo: change LoraModel to XXXModel
-        if LoraModel._check_target_module_exists(config, name) and isinstance(module, nn.Linear):
+        if LoraModel._check_target_module_exists(config, name) and isinstance(module, (Linear, LoraLinear)):
             yield name, module
+        # elif LoraModel._check_target_module_exists(config, name) and isinstance(module, LoraLinear):
+        #     yield name, module
 
-def target_params(model: nn.Module, config: XXXConfig) -> Iterable[nn.Parameter]:
-    # TODO: maybe support bias
-    for name, module in target_modules(model, config):
-        yield f"{name}.weight", module.weight
+# def target_params(model: nn.Module, config: XXXConfig) -> Iterable[nn.Parameter]:
+#     # TODO: maybe support bias
+#     for name, module in target_modules(model, config):
+#         yield f"{name}.weight", module.weight
 
 def get_model_device(model: nn.Module) -> str:
     if hasattr(model, "module"):  # Handle DeepSpeed/DataParallel
         model = model.module
     return next(iter(model.parameters())).device.type
-
-def get_param_downsample_mask(
-    name: str,
-    num_params: int,
-    n_param_downsample_rate: float,
-    fwd_importance_sampling: bool = False,
-    fwd_importance_score_path: Optional[str] = None,
-    bwd_importance_sampling: bool = False,
-    bwd_importance_score_path: Optional[str] = None,
-) -> torch.Tensor:
-    if n_param_downsample_rate > 1.0 or n_param_downsample_rate <= 0.0:
-        raise ValueError("n_param_downsample_rate should be in (0.0, 1.0].")
-    elif n_param_downsample_rate == 1.0:
-        mask = torch.arange(num_params).clone()  # Use all params
-        return mask
-    else:
-        k = int(num_params * n_param_downsample_rate)
-        if not fwd_importance_sampling and not bwd_importance_sampling:
-            mask = torch.randperm(num_params)[:k].clone()
-            return mask
-        
-        fwd_importance_score = None
-        bwd_importance_score = None
-        if fwd_importance_sampling:
-            assert fwd_importance_score_path is not None, "fwd_importance_score_path should be specified when fwd_importance_sampling is True."
-            fwd_importance_score = torch.load(
-                f"{fwd_importance_score_path}/{name.replace('.', '-')}.pt",
-            )
-        if bwd_importance_sampling:
-            assert bwd_importance_score_path is not None, "bwd_importance_score_path should be specified when bwd_importance_sampling is True."
-            bwd_importance_score = torch.load(
-                f"{bwd_importance_score_path}/{name.replace('.', '-')}.pt",
-            ) + EPS
-        
-        if fwd_importance_score is None:
-            fwd_importance_score = torch.ones_like(bwd_importance_score)
-        if bwd_importance_score is None:
-            bwd_importance_score = torch.ones_like(fwd_importance_score)
-        
-        score = fwd_importance_score / bwd_importance_score
-        # take top-k indices
-        _, mask = torch.topk(score, k=k, largest=True, sorted=False)
-        return mask
 
 def preprocess_xxx(
     model: nn.Module,
@@ -126,65 +90,38 @@ def preprocess_xxx(
     quantize_stiff_basis = xxx_config.preprocess_config.quantize_stiff_basis
     if quantize_stiff_basis:
         torch.serialization.add_safe_globals([QuantState])
-    fwd_importance_sampling = xxx_config.preprocess_config.fwd_importance_sampling
-    bwd_importance_sampling = xxx_config.preprocess_config.bwd_importance_sampling
     
     for module_name, module in target_modules(model, xxx_config):
-        module_stiff_basis = {}
-        for param_name, _ in target_params(model, xxx_config):
-            if not param_name.startswith(module_name):
-                continue
-            file_name = param_name.replace('.', '-')
-            if fwd_importance_sampling:
-                file_name += "_fwd"
-            if bwd_importance_sampling:
-                file_name += "_bwd"
-            
-            if not os.path.exists(f"{stiff_basis_path}/{file_name}.pt"):
-                raise FileNotFoundError(f"Stiff basis file for {param_name} not found in {stiff_basis_path}, run preprocess.py to build stiff basis first.")
+        file_name = module_name.replace('.', '-')
+        
+        if not os.path.exists(f"{stiff_basis_path}/{file_name}.pt"):
+            raise FileNotFoundError(f"Stiff basis file for {module_name} not found in {stiff_basis_path}, run preprocess.py to build stiff basis first.")
 
-            print(f"Loading stiff basis from {stiff_basis_path}/{file_name}.pt on cuda:{local_rank} ...")
-            stiff_basis = torch.load(f"{stiff_basis_path}/{file_name}.pt", map_location=f"cuda:{local_rank}")
-            
-            if quantize_stiff_basis:
-                assert "quant_state" in stiff_basis, "quantize_stiff_basis is True but quant_state not found in the loaded stiff basis."
-            else:
-                assert "quant_state" not in stiff_basis, "quantize_stiff_basis is False but quant_state found in the loaded stiff basis."
-                stiff_basis['stiff_basis'] = stiff_basis['stiff_basis'].to(model.dtype)
-            # items = [(k, v) for k, v in stiff_basis.items()]
-            # for k, v in items:
-            #     if "mask" not in k:
-            #         jac[k] = quantized_jac
-            #         jac["quant_state"] = quant_state
-            #     else:
-            #         stiff_basis[k] = v
-            module_stiff_basis[param_name.split('.')[-1]] = stiff_basis
-        module.xxx_stiff_basis = module_stiff_basis
+        print(f"Loading stiff basis from {stiff_basis_path}/{file_name}.pt on cuda:{local_rank} ...")
+        stiff_basis = torch.load(f"{stiff_basis_path}/{file_name}.pt", map_location=f"cuda:{local_rank}")
+        
+        if quantize_stiff_basis:
+            assert "quant_state_a" in stiff_basis and "quant_state_b" in stiff_basis, "quantize_stiff_basis is True but quant_state not found in the loaded stiff basis."
+        else:
+            assert "quant_state_a" not in stiff_basis and "quant_state_b" not in stiff_basis, "quantize_stiff_basis is False but quant_state found in the loaded stiff basis."
+            stiff_basis['stiff_basis_a'] = stiff_basis['stiff_basis_a'].to(model.dtype)
+            stiff_basis['stiff_basis_b'] = stiff_basis['stiff_basis_b'].to(model.dtype)
+
+        module.xxx_stiff_basis = stiff_basis
 
 def calculate_jacobian(
     model: nn.Module,
     config: XXXConfig,
     data_loader: List[Dict[str, torch.Tensor]],
-    mask_path: Optional[str] = None,
 ):
     save_path = config.preprocess_config.jacobian_path
     assert isinstance(save_path, str), f"jacobian_path in preprocess_config is expected to be a string for calculating and saving jacobians, got {type(config.jacobian_path)}."
-    n_param_downsample_rate = config.preprocess_config.n_param_downsample_rate
-    fwd_importance_sampling = config.preprocess_config.fwd_importance_sampling
-    bwd_importance_sampling = config.preprocess_config.bwd_importance_sampling
-    fwd_importance_score_path = config.preprocess_config.fwd_importance_score_path
-    bwd_importance_score_path = config.preprocess_config.bwd_importance_score_path
 
     model.train()
     os.makedirs(save_path, exist_ok=True)
-    for name, p in target_params(model, config):
-        assert len(p.shape) <= 2
+    for name, module in target_modules(model, config):
         assert '-' not in name
         file_name = name.replace('.', '-')
-        if fwd_importance_sampling:
-            file_name += f"_fwd"
-        if bwd_importance_sampling:
-            file_name += f"_bwd"
 
         if os.path.exists(f"{save_path}/{file_name}.pt"):
             print(f"Jacobian file for {save_path}/{name} already exists, skipping.")
@@ -193,35 +130,26 @@ def calculate_jacobian(
         print(f"Calculating jacobian for {save_path}/{name} ...")
         for param in model.parameters():
             param.requires_grad = False
-        grads = []
-        p.requires_grad = True  # Only compute gradient for the target parameter
-
-        if mask_path is not None:
-            assert os.path.exists(f"{mask_path}/{file_name}.pt"), f"Mask file for {name} not found in {mask_path}."
-            mask = torch.load(f"{mask_path}/{file_name}.pt", map_location=get_model_device(model))['mask']
-        else:
-            mask = get_param_downsample_mask(
-                name,
-                p.numel(), 
-                n_param_downsample_rate,
-                fwd_importance_sampling,
-                fwd_importance_score_path,
-                bwd_importance_sampling,
-                bwd_importance_score_path
-            )
-
+        grads_a = []
+        grads_b = []
+        module.lora_A.xxx.weight.requires_grad = True  # Only compute gradient for the target parameter
+        module.lora_B.xxx.weight.requires_grad = True
+        
         for data in tqdm(data_loader):
             data = {k: v.to(model.device) for k, v in data.items()}
             model.zero_grad()
             outputs = model(**data)
             outputs.loss.backward()
-            assert p.grad is not None
-            grads.append(p.grad.reshape(-1)[mask].clone().cpu())
+            assert module.lora_A.xxx.weight.grad is not None
+            assert module.lora_B.xxx.weight.grad is not None
+            grads_a.append(module.lora_A.xxx.weight.grad.reshape(-1).clone().cpu())
+            grads_b.append(module.lora_B.xxx.weight.grad.reshape(-1).clone().cpu())
         model.zero_grad()
         
         # stack grads into jacobian matrix
-        jac = torch.stack(grads, dim=0)
-        torch.save(dict(jac=jac, mask=mask), f"{save_path}/{file_name}.pt")
+        jac_a = torch.stack(grads_a, dim=0)
+        jac_b = torch.stack(grads_b, dim=0)
+        torch.save(dict(lora_a=jac_a, lora_b=jac_b), f"{save_path}/{file_name}.pt")
 
 @torch.no_grad()
 def calculate_stiff_basis(
@@ -242,19 +170,12 @@ def calculate_stiff_basis(
 
     assert r_stiff_basis is not None, \
         "r_stiff_basis in preprocess_config should be specified for calculating and saving stiff basis."
-    fwd_importance_sampling = config.preprocess_config.fwd_importance_sampling
-    bwd_importance_sampling = config.preprocess_config.bwd_importance_sampling
     quantize_stiff_basis = config.preprocess_config.quantize_stiff_basis
 
     os.makedirs(save_path, exist_ok=True)
-    for name, p in target_params(model, config):
-        assert len(p.shape) <= 2
+    for name, module in target_modules(model, config):
         assert '-' not in name
         file_name = name.replace('.', '-')
-        if fwd_importance_sampling:
-            file_name += f"_fwd"
-        if bwd_importance_sampling:
-            file_name += f"_bwd"
 
         if os.path.exists(f"{save_path}/{file_name}.pt"):
             print(f"Stiff basis file for {save_path}/{name} already exists, skipping.")
@@ -262,77 +183,52 @@ def calculate_stiff_basis(
 
         print(f"Calculating stiff basis for {name} ...")
 
-        full_jacobian = []
-        mask = None
+        full_jacobian_a = []
+        full_jacobian_b = []
         for jacobian_path in jacobian_paths:
             if not os.path.exists(f"{jacobian_path}/{file_name}.pt"):
                 raise FileNotFoundError(f"Jacobian file for {name} not found in {jacobian_path}, cannot calculate stiff basis.")
 
             jac = torch.load(f"{jacobian_path}/{file_name}.pt", map_location=get_model_device(model))
-            if mask is None:
-                mask = jac['mask']
-            else:
-                assert torch.equal(mask, jac['mask']), "Masks from different jacobian files do not match."
-            full_jacobian.append(jac['jac'])
-        full_jacobian = torch.cat(full_jacobian, dim=0).to(torch.float32)
+            full_jacobian_a.append(jac['lora_a'])
+            full_jacobian_b.append(jac['lora_b'])
+        full_jacobian_a = torch.cat(full_jacobian_a, dim=0).to(torch.float32)
+        full_jacobian_b = torch.cat(full_jacobian_b, dim=0).to(torch.float32)
             
-        if full_jacobian.shape[0] < r_stiff_basis:
+        if full_jacobian_a.shape[0] < r_stiff_basis:
             warnings.warn(
-                f"r_stiff_basis {r_stiff_basis} is larger than the total number of knowledge dataset samples {full_jacobian.shape[0]} for parameter {name}."
+                f"r_stiff_basis {r_stiff_basis} is larger than the total number of knowledge dataset samples {full_jacobian_a.shape[0]} for parameter {name}."
             )
-        U, S, _ = torch.linalg.svd(full_jacobian.T, full_matrices=False)
+        
+        U, S, _ = torch.linalg.svd(full_jacobian_a.T, full_matrices=False)
         if adaptive_r_stiff_basis:
             max_r_stiff_basis = r_stiff_basis
             cumulative_energy = torch.cumsum(S ** 2, dim=0) / torch.sum(S ** 2)
             r_stiff_basis = (torch.searchsorted(cumulative_energy, cumulative_energy_threshold) + 1).clip(min_r_stiff_basis, max_r_stiff_basis)
             print(f"Adjusted r_stiff_basis to {r_stiff_basis} for parameter {name} based on energy threshold {cumulative_energy_threshold}.")
-        stiff_basis = U[:, :r_stiff_basis]
+        stiff_basis_a = U[:, :r_stiff_basis]
+        
+        U, S, _ = torch.linalg.svd(full_jacobian_b.T, full_matrices=False)
+        if adaptive_r_stiff_basis:
+            max_r_stiff_basis = r_stiff_basis
+            cumulative_energy = torch.cumsum(S ** 2, dim=0) / torch.sum(S ** 2)
+            r_stiff_basis = (torch.searchsorted(cumulative_energy, cumulative_energy_threshold) + 1).clip(min_r_stiff_basis, max_r_stiff_basis)
+            print(f"Adjusted r_stiff_basis to {r_stiff_basis} for parameter {name} based on energy threshold {cumulative_energy_threshold}.")
+        stiff_basis_b = U[:, :r_stiff_basis]
         
         if quantize_stiff_basis:
-            quantized_stiff_basis, quant_state = quantize_blockwise(stiff_basis)
-            torch.save(dict(stiff_basis=quantized_stiff_basis, quant_state=quant_state, mask=mask), f"{save_path}/{file_name}.pt")
+            quantized_stiff_basis_a, quant_state_a = quantize_blockwise(stiff_basis_a)
+            quantized_stiff_basis_b, quant_state_b = quantize_blockwise(stiff_basis_b)
+            torch.save(dict(
+                init_lora_a=module.lora_A.xxx.weight,
+                init_lora_b=module.lora_B.xxx.weight,
+                stiff_basis_a=quantized_stiff_basis_a, 
+                quant_state_a=quant_state_a,
+                stiff_basis_b=quantized_stiff_basis_b, 
+                quant_state_b=quant_state_b
+            ), f"{save_path}/{file_name}.pt")
         else:
-            torch.save(dict(stiff_basis=stiff_basis, mask=mask), f"{save_path}/{file_name}.pt")
-
-def calculate_importance_score(
-    model: nn.Module,
-    data_loader: List[Dict[str, torch.Tensor]],
-    config: XXXConfig,
-    mode: str,
-    save_path: str,
-):
-    model.train()
-    os.makedirs(save_path, exist_ok=True)
-    grad = {}
-    assert mode in IMPORTANCE_SCORE_MODE, f"Unsupported importance score mode: {mode}"
-    for param in model.parameters():
-        param.requires_grad = False
-    for name, p in target_params(model, config):
-        if os.path.exists(f"{save_path}/{name.replace('.', '-')}.pt"):
-            print(f"Importance score file for {name} already exists, skipping.")
-            continue
-        p.requires_grad = True  # Only compute gradient for the target parameter
-        grad[name] = torch.zeros_like(p).reshape(-1).cpu()
-    
-    if len(grad) == 0:
-        return
-    else:
-        for data in tqdm(data_loader):
-            data = {k: v.to(model.device) for k, v in data.items()}
-            model.zero_grad()
-            outputs = model(**data)
-            outputs.loss.backward()
-
-            for name in grad:
-                p = model.get_parameter(name)
-                assert p.grad is not None
-                grad[name] += IMPORTANCE_SCORE_MODE[mode](p.grad).reshape(-1).clone().cpu()
-        model.zero_grad()
-
-        for name in grad:
-            grad[name] /= len(data_loader)
-            assert '-' not in name
-            torch.save(grad[name], f"{save_path}/{name.replace('.', '-')}.pt")
+            torch.save(dict(stiff_basis_a=stiff_basis_a, stiff_basis_b=stiff_basis_b), f"{save_path}/{file_name}.pt")
 
 
 class ProjectionCallback(TrainerCallback):
@@ -344,12 +240,23 @@ class ProjectionCallback(TrainerCallback):
         model = kwargs["model"]
         for _, module in model.named_modules():
             if isinstance(module, XXXLayer):
-                delta_weight = module.xxx_delta_weight[model.active_adapter]
-                stiff_basis = module.xxx_stiff_basis_w[model.active_adapter]()
-                quant_state = module.xxx_stiff_basis_w_quant_state[model.active_adapter]
-                stiff_basis = dequantize_blockwise(stiff_basis, quant_state)
+                lora_a = module.lora_A[model.active_adapter].weight
+                lora_b = module.lora_B[model.active_adapter].weight
+                init_lora_a = module.xxx_init_lora_a[model.active_adapter]
+                init_lora_b = module.xxx_init_lora_b[model.active_adapter]
+                delta_a = lora_a - init_lora_a
+                delta_b = lora_b - init_lora_b
+                stiff_basis_a = module.xxx_stiff_basis_a[model.active_adapter]()
+                stiff_basis_b = module.xxx_stiff_basis_b[model.active_adapter]()
+                quant_state_a = module.xxx_stiff_basis_a_quant_state[model.active_adapter]
+                quant_state_b = module.xxx_stiff_basis_b_quant_state[model.active_adapter]
+                stiff_basis_a = dequantize_blockwise(stiff_basis_a, quant_state_a)
+                stiff_basis_b = dequantize_blockwise(stiff_basis_b, quant_state_b)
                 # print("\nnorm before projection:", delta_weight.data.norm().item())
                 # print(torch.isfinite(delta_weight).all())
-                delta_weight.data = delta_weight.data - delta_weight.data @ stiff_basis @ stiff_basis.T
+                projected_delta_a = delta_a.data.reshape(-1) - delta_a.data.reshape(-1) @ stiff_basis_a @ stiff_basis_a.T
+                projected_delta_b = delta_b.data.reshape(-1) - delta_b.data.reshape(-1) @ stiff_basis_b @ stiff_basis_b.T
+                lora_a.data = projected_delta_a.reshape(lora_a.shape) + init_lora_a.data
+                lora_b.data = projected_delta_b.reshape(lora_b.shape) + init_lora_b.data
                 # print("norm after projection:", delta_weight.data.norm().item())
         return control

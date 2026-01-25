@@ -45,13 +45,14 @@ CACHE_ROOT = "/Data2/zhengzhilong"  # peft/examples/corda_finetuning
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     model_name_or_path: str = field(default="meta-llama/Llama-2-7b-hf")
-    knowledge_dataset: list[str] = field(default_factory=lambda: ["nqopen", "trivia_qa"])
+    knowledge_dataset: list[str] = field(default_factory=lambda: ["nqopen",])
+    lora_r: int = field(
+        default=128,
+        metadata={"help": "The rank of LoRA adapter."},
+    )
     r_stiff_basis: int = field(default=128)
     adaptive_r_stiff_basis: bool = field(default=False)
     cumulative_energy_threshold: float = field(default=0.9)
-    n_param_downsample_rate: float = field(default=0.01)
-    fwd_importance_sampling: bool = field(default=False)
-    bwd_importance_sampling: bool = field(default=False)
     quantize_stiff_basis: bool = field(default=True)
     seed: Optional[int] = field(default=233)
     data_path: str = field(default="fxmeng/pissa-dataset", metadata={"help": "Path to the training data."})
@@ -70,9 +71,9 @@ class TrainingArguments(transformers.TrainingArguments):
         default=512,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
-    lora_r: int = field(
-        default=128,
-        metadata={"help": "The rank of LoRA adapter. When passing `None`, CorDA or full fine-tuning is used."},
+    learning_rate: float = field(
+        default=5e-5,
+        metadata={"help": "The initial learning rate for AdamW."},
     )
 
 
@@ -200,17 +201,20 @@ def train():
         
         dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
         if args.adaptive_r_stiff_basis:
-            path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_adaptive_r{args.r_stiff_basis}_thres{args.cumulative_energy_threshold}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+            path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_adaptive_r{args.r_stiff_basis}_thres{args.cumulative_energy_threshold}_{args.seed}"
         else:
-            path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+            path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}"
         preprocess_config = XXXPreprocessConfig(
             stiff_basis_path=f"{CACHE_ROOT}/stiff_basis/{path_name}",
-            fwd_importance_sampling=args.fwd_importance_sampling,
-            bwd_importance_sampling=args.bwd_importance_sampling,
             quantize_stiff_basis=args.quantize_stiff_basis,
         )
         xxx_config = XXXConfig(
-            target_modules=["up_proj"],
+            r=args.lora_r,
+            lora_alpha=args.lora_r,
+            target_modules=["0.self_attn.q_proj", "0.mlp.gate_proj"],
+            init_lora_weights="orthogonal",
+            lora_dropout=0,
+            bias="none",
             task_type="CAUSAL_LM",
             preprocess_config=preprocess_config,
         )
@@ -242,6 +246,7 @@ def train():
             torch_dtype=torch.bfloat16,
             # device_map="auto",
         )
+
     if args.local_rank == 0:
         trainable_params, all_param = get_nb_trainable_parameters(model)
         print(
@@ -293,8 +298,6 @@ def train():
         "data_collator": data_collator,
     }
     trainer = Trainer(model=model, processing_class=tokenizer, args=args, **data_module)
-    projection_callback = ProjectionCallback()
-    trainer.add_callback(projection_callback)
     projection_callback = ProjectionCallback()
     trainer.add_callback(projection_callback)
     if args.local_rank == 0:

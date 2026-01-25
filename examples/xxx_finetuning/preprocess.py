@@ -14,7 +14,10 @@
 
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
+from peft.mapping_func import get_peft_model
+from peft.tuners.lora.config import LoraConfig
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import numpy as np
@@ -24,7 +27,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from peft.tuners.xxx.config import XXXConfig, XXXPreprocessConfig
-from peft.tuners.xxx.utils import calculate_jacobian, calculate_stiff_basis, calculate_importance_score
+from peft.tuners.xxx.utils import calculate_jacobian, calculate_stiff_basis
 
 CACHE_ROOT = "/Data2/zhengzhilong"  # peft/examples/corda_finetuning
 
@@ -67,21 +70,32 @@ def main(args):
         model_id, 
         device_map="auto"
     )
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_r,
+        init_lora_weights = "orthogonal",
+        target_modules=args.target_modules,
+        lora_dropout=0,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config, adapter_name='xxx')
 
-    mask_path = None
     jacobian_paths = []
     # Get the shared part of preprocess config and xxx config
     preprocess_config = XXXPreprocessConfig(
-        n_param_downsample_rate=args.n_param_downsample_rate,
         quantize_stiff_basis=args.quantize_stiff_basis,
     )
-    if args.fwd_importance_sampling:
-        preprocess_config.fwd_importance_sampling = True
-        preprocess_config.fwd_importance_score_path = f"{CACHE_ROOT}/fwd_importance_score/{path_name}"
-    if args.bwd_importance_sampling:
-        preprocess_config.bwd_importance_sampling = True
-        preprocess_config.bwd_importance_score_path = f"{CACHE_ROOT}/bwd_importance_score/{path_name}"
-    xxx_config = XXXConfig(target_modules=args.target_modules,)
+    # xxx_config = XXXConfig(target_modules=args.target_modules,)
+    xxx_config = XXXConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_r,
+        target_modules=args.target_modules,
+        init_lora_weights="orthogonal",
+        lora_dropout=0,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
     
     for dataset_name in args.knowledge_dataset:
         # Collect data
@@ -92,60 +106,24 @@ def main(args):
             nsamples=args.n_knowledge_samples, 
             seed=args.seed
         )
-        task_data_loader = None
-        if args.fwd_importance_sampling:
-            task_data_loader = get_knowledge_data(
-                name=args.task_dataset, 
-                tokenizer=tokenizer, 
-                model_id=model_id, 
-                nsamples=args.n_task_samples, 
-                seed=args.seed
-            )
 
         dataset_name = dataset_name.replace("/", "_")
-        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_{args.n_knowledge_samples}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_{args.n_knowledge_samples}_{args.seed}"
         preprocess_config.jacobian_path = f"{CACHE_ROOT}/jacobian/{path_name}"
         xxx_config.preprocess_config = preprocess_config
 
-        if args.fwd_importance_sampling:
-            calculate_importance_score(
-                model,
-                task_data_loader,
-                xxx_config,
-                mode="abs",
-                save_path=preprocess_config.fwd_importance_score_path,
-            )
-        if args.bwd_importance_sampling:
-            calculate_importance_score(
-                model,
-                knowledge_data_loader,
-                xxx_config,
-                mode="abs",
-                save_path=preprocess_config.bwd_importance_score_path,
-            )
-
-        # preprocess_xxx(
-        #     model,
-        #     xxx_config,
-        #     knowledge_data_loader=knowledge_data_loader,
-        #     task_data_loader=task_data_loader
-        # )
         calculate_jacobian(
             model, 
             xxx_config, 
-            data_loader=knowledge_data_loader, 
-            mask_path=mask_path,
+            data_loader=knowledge_data_loader,
         )
-        if mask_path is None:
-            # Use the first dataset to generate the mask
-            mask_path = preprocess_config.jacobian_path
         jacobian_paths.append(preprocess_config.jacobian_path)
     
     dataset_name = "_".join(sorted(args.knowledge_dataset)).replace("/", "_")
     if args.adaptive_r_stiff_basis:
-        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_adaptive_r{args.r_stiff_basis}_thres{args.cumulative_energy_threshold}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_adaptive_r{args.r_stiff_basis}_thres{args.cumulative_energy_threshold}_{args.seed}"
     else:
-        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}_down{int(1/args.n_param_downsample_rate)}"
+        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}"
     preprocess_config.jacobian_path = jacobian_paths
     preprocess_config.stiff_basis_path = f"{CACHE_ROOT}/stiff_basis/{path_name}"
     preprocess_config.r_stiff_basis = args.r_stiff_basis
@@ -169,7 +147,8 @@ if __name__ == "__main__":
         "--target_modules",
         type=str,
         nargs="+",
-        default=["k_proj","up_proj","v_proj","o_proj","q_proj","gate_proj","down_proj"],
+        # default=["k_proj","up_proj","v_proj","o_proj","q_proj","gate_proj","down_proj"],
+        default=["0.self_attn.q_proj", "0.mlp.gate_proj"],
         help="Pretrained model ID",
     )
     parser.add_argument(
@@ -187,14 +166,14 @@ if __name__ == "__main__":
         help="knowledge dataset",
     )
     parser.add_argument(
-        "--n_param_downsample_rate",
-        type=float,
-        default=0.02,
+        "--lora_r",
+        type=int,
+        default=128,
     )
     parser.add_argument(
         "--r_stiff_basis",
         type=int,
-        default=256,
+        default=128,
     )
     parser.add_argument(
         "--adaptive_r_stiff_basis",
@@ -210,16 +189,6 @@ if __name__ == "__main__":
         "--min_r_stiff_basis",
         type=int,
         default=1,
-    )
-    parser.add_argument(
-        "--fwd_importance_sampling",
-        type=bool,
-        default=False,
-    )
-    parser.add_argument(
-        "--bwd_importance_sampling",
-        type=bool,
-        default=False,
     )
     parser.add_argument(
         "--quantize_stiff_basis",
