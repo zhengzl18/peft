@@ -28,7 +28,7 @@ from peft.utils.other import transpose
 class BufferWrapper(nn.Module):
     def __init__(self, tensor):
         super().__init__()
-        self.register_buffer("buffer", tensor.contiguous())
+        self.register_buffer("buffer", tensor)
         # self.original_shape = base_layer.weight.shape
         
     def forward(self, *args, **kwargs):
