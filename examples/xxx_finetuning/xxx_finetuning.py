@@ -18,7 +18,7 @@ import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 from peft.tuners.xxx.config import XXXConfig, XXXPreprocessConfig
 from peft.tuners.xxx.utils import ProjectionCallback, preprocess_xxx
@@ -53,6 +53,8 @@ class TrainingArguments(transformers.TrainingArguments):
     r_jac_approx: int = field(default=28)
     r_stiff_basis: int = field(default=256)
     n_knowledge_samples: int = field(default=256)
+    proj_interval: int = field(default=1)
+    init_lora_weights: Union[str, bool] = field(default=True)
     adaptive_r_stiff_basis: bool = field(default=False)
     cumulative_energy_threshold: float = field(default=0.9)
     quantize_stiff_basis: bool = field(default=True)
@@ -216,7 +218,7 @@ def train():
             r=args.lora_r,
             lora_alpha=args.lora_r,
             target_modules=["0.self_attn.q_proj", ],
-            init_lora_weights=True,
+            init_lora_weights=args.init_lora_weights,
             lora_dropout=0,
             bias="none",
             task_type="CAUSAL_LM",
@@ -236,7 +238,7 @@ def train():
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_r,
-            init_lora_weights=True, #script_args.init_lora_weights,
+            init_lora_weights=args.init_lora_weights,
             target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
             lora_dropout=0,
             bias="none",
