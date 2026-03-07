@@ -302,12 +302,17 @@ def train():
         "data_collator": data_collator,
     }
     trainer = Trainer(model=model, processing_class=tokenizer, args=args, **data_module)
-    projection_callback = ProjectionCallback()
+    projection_callback = ProjectionCallback(
+        local_rank=args.local_rank, 
+        proj_interval=args.proj_interval
+    )
     trainer.add_callback(projection_callback)
     if args.local_rank == 0:
         print("Start training...")
     trainer.train()
     trainer.save_state()
+    model = model.merge_and_unload()
+    model = model.to(torch.bfloat16)
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 

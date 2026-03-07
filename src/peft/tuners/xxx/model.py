@@ -75,6 +75,7 @@ class XXXModel(LoraModel):
             "lora_alpha": alpha,
             "lora_dropout": xxx_config.lora_dropout,
             "fan_in_fan_out": xxx_config.fan_in_fan_out,
+            "init_lora_weights": xxx_config.init_lora_weights,
             "ephemeral_gpu_offload": xxx_config.runtime_config.ephemeral_gpu_offload,
             "lora_bias": xxx_config.lora_bias,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
@@ -91,6 +92,7 @@ class XXXModel(LoraModel):
                 r=r,
                 lora_alpha=alpha,
                 lora_dropout=xxx_config.lora_dropout,
+                init_lora_weights=xxx_config.init_lora_weights,
                 lora_bias=xxx_config.lora_bias,
                 inference_mode=xxx_config.inference_mode,
             )
