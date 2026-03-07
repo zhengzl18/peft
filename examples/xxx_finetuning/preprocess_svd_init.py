@@ -27,7 +27,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from peft.tuners.xxx.config import XXXConfig, XXXPreprocessConfig
-from peft.tuners.xxx.utils import calculate_jacobian, calculate_stiff_basis
+from peft.tuners.xxx.utils import calculate_jacobian_svd_init as calculate_jacobian, calculate_stiff_basis
 
 CACHE_ROOT = "/Data1/zhengzhilong"
 
@@ -70,16 +70,16 @@ def main(args):
         model_id, 
         device_map="auto"
     )
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_r,
-        init_lora_weights="pissa",
-        target_modules=args.target_modules,
-        lora_dropout=0,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config, adapter_name='xxx')
+    # lora_config = LoraConfig(
+    #     r=args.lora_r,
+    #     lora_alpha=args.lora_r,
+    #     init_lora_weights = "pissa",
+    #     target_modules=args.target_modules,
+    #     lora_dropout=0,
+    #     bias="none",
+    #     task_type="CAUSAL_LM",
+    # )
+    # model = get_peft_model(model, lora_config, adapter_name='xxx')
 
     jacobian_paths = []
     # Get the shared part of preprocess config and xxx config
@@ -91,7 +91,6 @@ def main(args):
         r=args.lora_r,
         lora_alpha=args.lora_r,
         target_modules=args.target_modules,
-        init_lora_weights="pissa",
         lora_dropout=0,
         bias="none",
         task_type="CAUSAL_LM",
@@ -108,7 +107,7 @@ def main(args):
         )
 
         dataset_name = dataset_name.replace("/", "_")
-        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_{args.n_knowledge_samples}_{args.seed}"
+        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_svd_init_{args.n_knowledge_samples}_{args.seed}"
         preprocess_config.jacobian_path = f"{CACHE_ROOT}/jacobian/{path_name}"
         xxx_config.preprocess_config = preprocess_config
 
@@ -123,7 +122,7 @@ def main(args):
     if args.adaptive_r_stiff_basis:
         path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_adaptive_r{args.r_stiff_basis}_thres{args.cumulative_energy_threshold}_{args.seed}"
     else:
-        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}"
+        path_name = f"{dataset_name}_{args.model_id.replace('/', '_')}_svd_init_r{args.r_stiff_basis}_{args.seed}"
     preprocess_config.jacobian_path = jacobian_paths
     preprocess_config.stiff_basis_path = f"{CACHE_ROOT}/stiff_basis/{path_name}"
     preprocess_config.r_stiff_basis = args.r_stiff_basis
@@ -148,7 +147,7 @@ if __name__ == "__main__":
         type=str,
         nargs="+",
         # default=["k_proj","up_proj","v_proj","o_proj","q_proj","gate_proj","down_proj"],
-        default=["0.self_attn.q_proj", "0.mlp.gate_proj"],
+        default=["0.mlp.gate_proj"],
         help="Pretrained model ID",
     )
     parser.add_argument(

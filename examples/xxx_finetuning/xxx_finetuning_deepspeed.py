@@ -22,6 +22,7 @@ from typing import Optional
 from peft.tuners.xxx.config import XXXConfig, XXXPreprocessConfig
 from peft.tuners.xxx.utils import ProjectionCallback, preprocess_xxx
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True
 import transformers
 from datasets import load_dataset, concatenate_datasets
 from transformers import Trainer
@@ -37,7 +38,7 @@ PROMPT = (
     "### Instruction:\n{instruction}\n\n### Response:"
 )
 
-CACHE_ROOT = "/Data2/zhengzhilong"  # peft/examples/corda_finetuning
+CACHE_ROOT = "/Data1/zhengzhilong"
 
 
 @dataclass
@@ -48,7 +49,10 @@ class TrainingArguments(transformers.TrainingArguments):
         default=None,
         metadata={"help": "The rank of LoRA adapter."},
     )
+    r_jac_approx: int = field(default=None)
     r_stiff_basis: int = field(default=None)
+    n_knowledge_samples: int = field(default=256)
+    proj_interval: int = field(default=1)
     adaptive_r_stiff_basis: bool = field(default=False)
     cumulative_energy_threshold: float = field(default=0.9)
     quantize_stiff_basis: bool = field(default=True)
@@ -186,7 +190,6 @@ def train():
                 return f"__Unserializable_Object_of_Type_{type(obj).__name__}__"
         json.dump(vars(args), f, indent=4, default=set_default)
 
-
     if args.r_stiff_basis is not None:
         print("Train in XXX mode")
         print("Loading base model...")
@@ -200,16 +203,20 @@ def train():
         if args.adaptive_r_stiff_basis:
             path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_adaptive_r{args.r_stiff_basis}_thres{args.cumulative_energy_threshold}_{args.seed}"
         else:
-            path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}"
+            # path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_pissa_eval_r{args.r_stiff_basis}_{args.seed}"
+            path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_pissa_r_jac_approx{args.r_jac_approx}_{args.n_knowledge_samples}_{args.seed}"
+            # path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}"
         preprocess_config = XXXPreprocessConfig(
-            stiff_basis_path=f"{CACHE_ROOT}/stiff_basis/{path_name}",
+            stiff_basis_path=f"{CACHE_ROOT}/jacobian/{path_name}",
+            # stiff_basis_path=f"{CACHE_ROOT}/stiff_basis/{path_name}",
             quantize_stiff_basis=args.quantize_stiff_basis,
         )
         xxx_config = XXXConfig(
             r=args.lora_r,
             lora_alpha=args.lora_r,
+            # target_modules=["0.self_attn.q_proj", "0.self_attn.k_proj", "0.self_attn.v_proj", "0.self_attn.o_proj", "0.mlp.gate_proj", "0.mlp.up_proj", "0.mlp.down_proj",],
             target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
-            init_lora_weights="orthogonal",
+            init_lora_weights=True,
             lora_dropout=0,
             bias="none",
             task_type="CAUSAL_LM",
@@ -229,7 +236,7 @@ def train():
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_r,
-            init_lora_weights = True, #script_args.init_lora_weights,
+            init_lora_weights=True,
             target_modules=["q_proj", "o_proj", "k_proj", "v_proj", "gate_proj", "up_proj", "down_proj"],
             lora_dropout=0,
             bias="none",
@@ -298,11 +305,15 @@ def train():
     trainer = Trainer(
         model=model, tokenizer=tokenizer, args=args, **data_module
     )
-    projection_callback = ProjectionCallback()
+    projection_callback = ProjectionCallback(
+        local_rank=args.local_rank, 
+        proj_interval=args.proj_interval
+    )
     trainer.add_callback(projection_callback)
     trainer.train()
     trainer.save_state()
     model = model.merge_and_unload()
+    model = model.to(torch.bfloat16)
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
 

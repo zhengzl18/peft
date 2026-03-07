@@ -15,7 +15,7 @@
 import copy
 import json
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
@@ -39,7 +39,7 @@ PROMPT = (
     "### Instruction:\n{instruction}\n\n### Response:"
 )
 
-CACHE_ROOT = "/Data2/zhengzhilong"  # peft/examples/corda_finetuning
+CACHE_ROOT = "/Data1/zhengzhilong"
 
 
 @dataclass
@@ -50,14 +50,16 @@ class TrainingArguments(transformers.TrainingArguments):
         default=128,
         metadata={"help": "The rank of LoRA adapter."},
     )
-    r_stiff_basis: int = field(default=128)
+    r_jac_approx: int = field(default=28)
+    r_stiff_basis: int = field(default=256)
+    n_knowledge_samples: int = field(default=256)
     adaptive_r_stiff_basis: bool = field(default=False)
     cumulative_energy_threshold: float = field(default=0.9)
     quantize_stiff_basis: bool = field(default=True)
     seed: Optional[int] = field(default=233)
     data_path: str = field(default="fxmeng/pissa-dataset", metadata={"help": "Path to the training data."})
     dataset_split: str = field(default="train", metadata={"help": "(`['train', 'test', 'eval']`):"})
-    sub_task: list[str] = field(default_factory=lambda: ["metamath:1000"], metadata={"help": "(`['metamath', 'python', 'conversation']`)"})
+    sub_task: list[str] = field(default_factory=lambda: ["metamath:100"], metadata={"help": "(`['metamath', 'python', 'conversation']`)"})
     dataset_field: list[str] = field(default_factory=lambda: ["instruction", "output"], metadata={"help": "Fields of dataset input and output."})
     dataloader_num_proc: int = field(default=1, metadata={"help": "Number of processes to load dataset"})
     dataloader_batch_size: int = field(
@@ -203,16 +205,18 @@ def train():
         if args.adaptive_r_stiff_basis:
             path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_adaptive_r{args.r_stiff_basis}_thres{args.cumulative_energy_threshold}_{args.seed}"
         else:
-            path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_r{args.r_stiff_basis}_{args.seed}"
+            # path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_pissa_r{args.r_stiff_basis}_{args.seed}"
+            path_name = f"{dataset_name}_{args.model_name_or_path.replace('/', '_')}_pissa_r_jac_approx{args.r_jac_approx}_{args.n_knowledge_samples}_{args.seed}"
         preprocess_config = XXXPreprocessConfig(
-            stiff_basis_path=f"{CACHE_ROOT}/stiff_basis/{path_name}",
+            stiff_basis_path=f"{CACHE_ROOT}/jacobian/{path_name}",
+            # stiff_basis_path=f"{CACHE_ROOT}/stiff_basis/{path_name}",
             quantize_stiff_basis=args.quantize_stiff_basis,
         )
         xxx_config = XXXConfig(
             r=args.lora_r,
             lora_alpha=args.lora_r,
-            target_modules=["0.self_attn.q_proj", "0.mlp.gate_proj"],
-            init_lora_weights="orthogonal",
+            target_modules=["0.self_attn.q_proj", ],
+            init_lora_weights=True,
             lora_dropout=0,
             bias="none",
             task_type="CAUSAL_LM",

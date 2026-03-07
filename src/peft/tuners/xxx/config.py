@@ -52,6 +52,9 @@ class XXXPreprocessConfig:
             )
         },
     )
+    r_jac_approx: Optional[int] = field(
+        default=None,
+    )
     r_stiff_basis: Optional[int] = field(
         default=None,
     )
@@ -95,7 +98,7 @@ class XXXConfig(LoraConfig):
     def __post_init__(self):
         super().__post_init__()
         self.peft_type = PeftType.XXX
-        assert self.init_lora_weights == "orthogonal", "XXX only supports 'orthogonal' initialization for LoRA weights."
+        # assert self.init_lora_weights == "orthogonal", "XXX only supports 'orthogonal' initialization for LoRA weights."
         assert self.use_dora is False, "XXX does not support DoRA."
         assert self.use_rslora is False, "XXX does not support RS-LoRA."
         assert self.use_qalora is False, "XXX does not support QALoRA."
