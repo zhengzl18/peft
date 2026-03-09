@@ -216,8 +216,8 @@ def calculate_jacobian_w(
         jac_w_a = torch.stack(grads_w_a, dim=0)  # shape: (num_samples, out_features, in_features)
         jac_w_b = torch.stack(grads_w_b, dim=0)  # shape: (num_samples, out_features, in_features)
 
-        BB = torch.einsum('pkr, qks -> pqrs', B, B)
-        AA = torch.einsum('prm, qsm -> pqrs', A, A)
+        BB = torch.einsum('pkr, qks -> pqrs', jac_w_b, jac_w_b)
+        AA = torch.einsum('prm, qsm -> pqrs', jac_w_a, jac_w_a)
         K = torch.einsum('pqrs, pqrs -> pq', BB, AA)
         K_double = K.to(torch.float64)
         K_inv_double = torch.linalg.pinv(K_double)
