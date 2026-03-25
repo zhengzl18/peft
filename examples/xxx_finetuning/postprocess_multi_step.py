@@ -4,8 +4,8 @@ import shutil
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
-import concurrent
 import psutil
+from safetensors.torch import save_file, load_file
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn as nn
@@ -64,39 +64,13 @@ class DataCollatorForSupervisedDataset:
             "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
         }
 
+
 def target_modules(model: nn.Module, config: LoraConfig) -> Iterable[nn.Module]:
     if isinstance(model, PeftModel):
         model = model.get_base_model()
     for name, module in model.named_modules():
         if LoraModel._check_target_module_exists(config, name) and isinstance(module, (Linear, LoraLinear)):
             yield name, module
-
-@torch.no_grad()
-def svd_compress_features(a, b, r=32):
-    m, T, d_in = a.shape
-    _, _, d_out = b.shape
-    actual_r = min(r, T, d_in, d_out)  
-    
-    Q_b, R_b = torch.linalg.qr(b.transpose(1, 2))
-    Q_a, R_a = torch.linalg.qr(a.transpose(1, 2))
-    M = torch.bmm(R_b, R_a.transpose(1, 2))
-    U_M, S, V_M_h = torch.linalg.svd(M)
-    
-    U_M_r = U_M[:, :, :actual_r]                
-    S_r = S[:, :actual_r]                      
-    V_M_r = V_M_h.transpose(1, 2)[:, :, :actual_r] 
-    S_sqrt = torch.diag_embed(torch.sqrt(S_r))
-    
-    new_b_T = torch.bmm(Q_b, torch.bmm(U_M_r, S_sqrt)).transpose(1, 2)
-    new_a_T = torch.bmm(Q_a, torch.bmm(V_M_r, S_sqrt)).transpose(1, 2)
-    
-    if actual_r < r:
-        pad_a = torch.zeros(m, r - actual_r, d_in, device=a.device, dtype=a.dtype)
-        pad_b = torch.zeros(m, r - actual_r, d_out, device=b.device, dtype=b.dtype)
-        new_a_T = torch.cat([new_a_T, pad_a], dim=1)
-        new_b_T = torch.cat([new_b_T, pad_b], dim=1)
-        
-    return new_a_T, new_b_T
     
 
 class GlobalJacobianFreeProjector:
@@ -104,11 +78,13 @@ class GlobalJacobianFreeProjector:
         self,
         peft_adapter_path: str,
         r_jac_approx: int = 32,
-        delta_threshold: float = 0.,
-        beta: float = 0.9,
+        delta_threshold: float = 0.95,
+        beta: float = 0.8,
+        chunk_size: int = 56
     ):
         self.config = PeftConfig.from_pretrained(peft_adapter_path)
         self.r_jac_approx = r_jac_approx
+        self.chunk_size = chunk_size
 
         if "LOCAL_RANK" in os.environ:
             local_rank = int(os.environ["LOCAL_RANK"])
@@ -119,7 +95,7 @@ class GlobalJacobianFreeProjector:
         
         self.model = AutoModelForCausalLM.from_pretrained(
             "/home/fit/lishbo/WORK/data/zhengzhilong/anticf/pissa_residual_model/Llama-2-7b-hf",
-            dtype=torch.float32,
+            dtype=torch.float16,
             device_map={"": self.device}
         )
         peft_model = PeftModel.from_pretrained(
@@ -128,15 +104,13 @@ class GlobalJacobianFreeProjector:
             dtype=torch.float32,
         )
         peft_model = peft_model.merge_and_unload()
-
         self.model = AutoModelForCausalLM.from_pretrained(
             self.config.base_model_name_or_path,
-            dtype=torch.float32,
+            dtype=torch.float16,
             device_map={"": self.device}
         )
         self.model.gradient_checkpointing_enable()
         
-        # CPU 内存常驻：全量缓存 delta_w
         self.delta_w_dict = {}
         for name, module in target_modules(peft_model, self.config):
             self.delta_w_dict[name] = (module.weight.data - self.model.get_submodule(name).weight.data).clone().cpu()
@@ -149,379 +123,327 @@ class GlobalJacobianFreeProjector:
         self.jac_dir_old = f"{os.path.dirname(peft_adapter_path)}/jac_old"
         self.jac_dir_new = f"{os.path.dirname(peft_adapter_path)}/jac_new"
 
-    @staticmethod
-    def _load_single_chunk(b_idx, jac_dir_old, base_name):
-        f_a = f"{jac_dir_old}/{base_name}_a_{b_idx}.pt"
-        f_b = f"{jac_dir_old}/{base_name}_b_{b_idx}.pt"
-        # 直接返回元组
-        return (
-            torch.load(f_a, map_location="cpu", weights_only=True),
-            torch.load(f_b, map_location="cpu", weights_only=True)
-        )
+        self.Gram_old = None
+        self.P_old = None
+        self.Gram_new = None
+        self.P_new = None
+        self.alpha = 1.0
 
-    def _get_global_components(self, dataloader, target_jac_dir, calculate_y=True):
+    @torch.no_grad()
+    def _svd_compress_features(self, a, b, r=32):
+        m, T, d_in = a.shape
+        _, _, d_out = b.shape
+        actual_r = min(r, T, d_in, d_out)  
+        
+        Q_b, R_b = torch.linalg.qr(b.transpose(1, 2))
+        Q_a, R_a = torch.linalg.qr(a.transpose(1, 2))
+        M = torch.bmm(R_b, R_a.transpose(1, 2))
+        U_M, S, V_M_h = torch.linalg.svd(M)
+        
+        U_M_r = U_M[:, :, :actual_r]                
+        S_r = S[:, :actual_r]                      
+        V_M_r = V_M_h.transpose(1, 2)[:, :, :actual_r] 
+        S_sqrt = torch.diag_embed(torch.sqrt(S_r))
+        
+        new_b_T = torch.bmm(Q_b, torch.bmm(U_M_r, S_sqrt)).transpose(1, 2)
+        new_a_T = torch.bmm(Q_a, torch.bmm(V_M_r, S_sqrt)).transpose(1, 2)
+        
+        if actual_r < r:
+            pad_a = torch.zeros(m, r - actual_r, d_in, device=a.device, dtype=a.dtype)
+            pad_b = torch.zeros(m, r - actual_r, d_out, device=b.device, dtype=b.dtype)
+            new_a_T = torch.cat([new_a_T, pad_a], dim=1)
+            new_b_T = torch.cat([new_b_T, pad_b], dim=1)
+            
+        return new_a_T.to(torch.float16), new_b_T.to(torch.float16)
+
+
+    def _get_projection_components(self, dataloader, target_jac_dir, for_landing_point=False, global_proj=False):
+        print("Calculating Jacobian and projection components...")
+        assert not global_proj, "Global projection is not currently supported in this implementation."
         m_total = len(dataloader.dataset)
         device = self.device
+
+        if global_proj:
+            #* G_global = sum_i [G_i]
+            #* Jdw_global = sum_i [J_i@dw_i]
+            Gram = torch.zeros((m_total, m_total), device=device, dtype=torch.float64)
+            Jdw = torch.zeros((m_total,), device=device, dtype=torch.float64)
+        else:
+            Gram = {}
+        #* Projection correction term P for each layer
+        P = {}
+
+        all_modules = list(target_modules(self.model, self.config))
+        module_chunks = [all_modules[i:i + self.chunk_size] for i in range(0, len(all_modules), self.chunk_size)]
         
-        G_global = torch.zeros((m_total, m_total), device=device, dtype=torch.float64)
-        y_global = torch.zeros((m_total,), device=device, dtype=torch.float64) if calculate_y else None
-        
-        jac_w_cache = {
-            name: {'a': [], 'b': []} 
-            for name, _ in target_modules(self.model, self.config)
-        }
-        hooks = []
-        
-        for name, module in target_modules(self.model, self.config):
-            module.weight.requires_grad = True
+        for chunk_idx, chunk in enumerate(module_chunks):
+            print(f"\n=== Processing Layer Chunk {chunk_idx + 1}/{len(module_chunks)} ===")
             
-            def make_hooks(layer_name):
-                fwd_activation_cache = []
-                def fwd_hook(mod, inp, out):
-                    fwd_activation_cache.append(inp[0].detach())
-                    
-                def bwd_hook(mod, grad_input, grad_output):
-                    bwd_activation = grad_output[0].detach()  # Shape: (B, T, d_out)
-                    fwd_activation = fwd_activation_cache[-1]  # Shape: (B, T, d_in)
-                    
-                    fwd_activation_cache.clear()
-                    
-                    jac_w_a, jac_w_b = svd_compress_features(
-                        fwd_activation, 
-                        bwd_activation, 
-                        r=self.r_jac_approx
-                    )  # Shapes: (B, r, d_in), (B, r, d_out)
-                    jac_w_a, jac_w_b = jac_w_a.contiguous(), jac_w_b.contiguous()
-                    
-                    if dist.is_initialized():
-                        ws = dist.get_world_size()
-                        jac_w_a_gather = [torch.zeros_like(jac_w_a) for _ in range(ws)]
-                        jac_w_b_gather = [torch.zeros_like(jac_w_b) for _ in range(ws)]
-                        dist.all_gather(jac_w_a_gather, jac_w_a)
-                        dist.all_gather(jac_w_b_gather, jac_w_b)
-                        # Shape: (num_gpus * B, r, d_in) and (num_gpus * B, r, d_out).
-                        jac_w_a = torch.cat(jac_w_a_gather, dim=0)
-                        jac_w_b = torch.cat(jac_w_b_gather, dim=0)
-                    
-                    jac_w_cache[layer_name]['a'].append(jac_w_a.cpu())
-                    jac_w_cache[layer_name]['b'].append(jac_w_b.cpu())
-                    
-                return fwd_hook, bwd_hook
+            jac_w_cache = {name: {'a': [], 'b': []} for name, _ in chunk}
+            hooks = []
+            
+            for name, module in chunk:
+                module.weight.requires_grad = True
                 
-            f_hook, b_hook = make_hooks(name)
-            hooks.append(module.register_forward_hook(f_hook))
-            hooks.append(module.register_full_backward_hook(b_hook))
-
-        count = 0
-        for batch_inputs in dataloader:
-            count += 1
-            print(f"Processing batch {count}/{len(dataloader)}...")
-            monitor_gpu_vram()
-            monitor_cpu_ram()
-            
-            # batch_inputs = {k: v.to(self.device) for k, v in batch_inputs.items()}
-            # self.model.zero_grad(set_to_none=True)
-            # outputs = self.model(**batch_inputs)
-            # labels = batch_inputs["labels"]
-            # valid_token_num = (labels != IGNORE_INDEX).sum().item()
-            # loss = outputs.loss * valid_token_num 
-            # loss.backward()
-            # # outputs.loss.backward()
-            # self.model.zero_grad(set_to_none=True)
-            
-            # # --- 系统内存破局：批次分块落盘 ---
-            # for name in jac_w_cache.keys():
-            #     if len(jac_w_cache[name]['a']) > 0:
-            #         a_batch = torch.cat(jac_w_cache[name]['a'], dim=0)
-            #         b_batch = torch.cat(jac_w_cache[name]['b'], dim=0)
+                def make_hooks(layer_name):
+                    fwd_activation_cache = []
+                    def fwd_hook(mod, inp, out):
+                        fwd_activation_cache.append(inp[0].detach())
+                        
+                    def bwd_hook(mod, grad_input, grad_output):
+                        bwd_activation = grad_output[0].detach()  # Shape: (B, T, d_out)
+                        fwd_activation = fwd_activation_cache[-1]  # Shape: (B, T, d_in)
+                        fwd_activation_cache.clear()
+                        
+                        jac_w_a, jac_w_b = self._svd_compress_features(
+                            fwd_activation.float(), bwd_activation.float(), r=self.r_jac_approx
+                        )  
+                        jac_w_a, jac_w_b = jac_w_a.contiguous(), jac_w_b.contiguous()
+                        
+                        if dist.is_initialized():
+                            ws = dist.get_world_size()
+                            jac_w_a_gather = [torch.zeros_like(jac_w_a) for _ in range(ws)]
+                            jac_w_b_gather = [torch.zeros_like(jac_w_b) for _ in range(ws)]
+                            dist.all_gather(jac_w_a_gather, jac_w_a)
+                            dist.all_gather(jac_w_b_gather, jac_w_b)
+                            jac_w_a = torch.cat(jac_w_a_gather, dim=0)
+                            jac_w_b = torch.cat(jac_w_b_gather, dim=0)
+                        
+                        jac_w_cache[layer_name]['a'].append(jac_w_a.cpu())
+                        jac_w_cache[layer_name]['b'].append(jac_w_b.cpu())
+                        
+                    return fwd_hook, bwd_hook
                     
-            #         torch.save(a_batch, f"{target_jac_dir}/{name.replace('.', '-')}_a_{count}.pt")
-            #         torch.save(b_batch, f"{target_jac_dir}/{name.replace('.', '-')}_b_{count}.pt")
-                    
-            #         # 立即清空缓存防止 OOM
-            #         jac_w_cache[name]['a'].clear()
-            #         jac_w_cache[name]['b'].clear()
+                f_hook, b_hook = make_hooks(name)
+                hooks.append(module.register_forward_hook(f_hook))
+                hooks.append(module.register_full_backward_hook(b_hook))
 
-        for h in hooks:
-            h.remove()
-        for name, module in target_modules(self.model, self.config):
-            module.weight.requires_grad = False
+            print("Calculating Jacobian ...")
+            count = 0
+            for batch_inputs in dataloader:
+                count += 1
+                if count % 10 == 0:
+                    print(f"  Batch {count}/{len(dataloader)}...")
+                batch_inputs = {k: v.to(self.device) for k, v in batch_inputs.items()}
+                self.model.zero_grad(set_to_none=True)
+                outputs = self.model(**batch_inputs)
+                labels = batch_inputs["labels"]
+                valid_token_num = (labels != IGNORE_INDEX).sum().item()
+                loss = outputs.loss * valid_token_num 
+                loss.backward()
+                self.model.zero_grad(set_to_none=True)
 
-        num_batches = count
+            for h in hooks:
+                h.remove()
+            for name, module in chunk:
+                module.weight.requires_grad = False
 
-        # 懒加载：逐层读取碎片拼装 G_global
-        G_dict = {}
-        y_dict = {}
-        for name, _ in target_modules(self.model, self.config):
-            print(f"Calculating G_global for {name}")
-            monitor_gpu_vram()
-            monitor_cpu_ram()
-            
-
-            a_chunks, b_chunks = [], []
-            # for b_idx in range(1, num_batches + 1):
-            #     f_a = f"{target_jac_dir}/{name.replace('.', '-')}_a_{b_idx}.pt"
-            #     f_b = f"{target_jac_dir}/{name.replace('.', '-')}_b_{b_idx}.pt"
-            #     a_chunks.append(torch.load(f_a, map_location="cpu", weights_only=True))
-            #     b_chunks.append(torch.load(f_b, map_location="cpu", weights_only=True))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                # executor.map 会并发执行，并且保证返回的迭代器顺序与输入的 range 顺序完全一致
-                results = executor.map(
-                    lambda b_idx: GlobalJacobianFreeProjector._load_single_chunk(
-                        b_idx, 
-                        self.jac_dir_old, 
-                        name.replace('.', '-')
-                    ), 
-                    range(1, num_batches + 1)
-                )
+            for name, _ in chunk:
+                jac_w_a = torch.cat(jac_w_cache[name]['a'], dim=0)
+                jac_w_b = torch.cat(jac_w_cache[name]['b'], dim=0)
                 
-                # 拆解解包结果
-                for a, b in results:
-                    a_chunks.append(a)
-                    b_chunks.append(b)
+                file_path = f"{target_jac_dir}/{name.replace('.', '-')}.safetensors"
+                save_file({"a": jac_w_a, "b": jac_w_b}, file_path)
                 
-            jac_w_a = torch.cat(a_chunks, dim=0).to(self.device)
-            jac_w_b = torch.cat(b_chunks, dim=0).to(self.device)
-            
-            m, r = jac_w_a.shape[0], jac_w_a.shape[1]
-            
-            jac_w_a_flat = jac_w_a.view(m * r, -1).double()
-            jac_w_b_flat = jac_w_b.view(m * r, -1).double()
-            
-            Ka = jac_w_a_flat @ jac_w_a_flat.T 
-            Kb = jac_w_b_flat @ jac_w_b_flat.T
-            
-            #* G = J @ J^T
-            G_local = (Ka * Kb).view(m, r, m, r).sum(dim=(1, 3))  # Gram matrix of size (m, m) for this layer
-            # G_global += G_local
-            G_dict[name] = G_local.cpu()  # 存入 CPU 内存字典
-            
-            if calculate_y:
+                jac_w_a = jac_w_a.to(self.device)
+                jac_w_b = jac_w_b.to(self.device)
+                m, r = jac_w_a.shape[0], jac_w_a.shape[1]
+                
+                jac_w_a_flat = jac_w_a.view(m * r, -1).double()
+                jac_w_b_flat = jac_w_b.view(m * r, -1).double()
+                
+                Ka = jac_w_a_flat @ jac_w_a_flat.T 
+                Kb = jac_w_b_flat @ jac_w_b_flat.T
+                
+                #* G = J @ J^T
+                G_local = (Ka * Kb).view(m, r, m, r).sum(dim=(1, 3))  # Shape: (m, m)
+                if global_proj:
+                    Gram += G_local
+                else:
+                    Gram[name] = G_local.cpu()
+                
                 #* y = J @ delta_w
-                delta_w = self.delta_w_dict[name].to(self.device, dtype=torch.float64, non_blocking=True)
-                y_local = ((jac_w_a_flat @ delta_w.T) * jac_w_b_flat).view(m, r, -1).sum(dim=(1, 2))
-                # y_global += y_local
-                y_dict[name] = y_local.cpu()  # 存入 CPU 内存字典
+                if for_landing_point:
+                    delta_w = self.delta_w_dict[name].to(self.device, dtype=torch.float64, non_blocking=True)
+                    P_old = self.P_old[name].to(self.device, dtype=torch.float64, non_blocking=True)
+                    delta_w = (1 - self.alpha) * delta_w + self.alpha * P_old
+                else:
+                    delta_w = self.delta_w_dict[name].to(self.device, dtype=torch.float64, non_blocking=True)
+                Jdw_local = ((jac_w_a_flat @ delta_w.T) * jac_w_b_flat).view(m, r, -1).sum(dim=(1, 2)).cpu()  # Shape: (m,)
+                if global_proj:
+                    Jdw += Jdw_local
                 
-            del jac_w_a, jac_w_b, jac_w_a_flat, jac_w_b_flat, Ka, Kb, a_chunks, b_chunks
-            torch.cuda.empty_cache()
-            
-        # return num_batches, G_global, y_global
-        return num_batches, G_dict, y_dict
-
-    @staticmethod
-    @torch.no_grad()
-    def _compute_principal_angle(jac_dir_old, jac_dir_new, num_batches, names, G_global_0, G_global_1, eps=1e-10):
-        m = G_global_0.shape[0]
-        device = G_global_0.device
-        C_global = torch.zeros((m, m), device=device, dtype=torch.float64)
+                if not global_proj:
+                    #* P = J^T @ G^-1 @ J @ delta_w
+                    G_inv = torch.linalg.pinv(Gram[name].double(), rcond=1e-10)
+                    v = (G_inv @ Jdw_local.double()).to(device=self.device)
+                    P_local = torch.einsum(
+                        'm, mto, mti -> oi', 
+                        v, jac_w_b.double(), jac_w_a.double()
+                    )  # Shape: (d_out, d_in)
+                    P[name] = P_local.cpu()
+                
+                del jac_w_cache[name]
+                del jac_w_a, jac_w_b, jac_w_a_flat, jac_w_b_flat, Ka, Kb
+                torch.cuda.empty_cache()
         
-        # --- 算子生命周期融合：流式计算并当场销毁 ---
+        return Gram, P
+
+    @torch.no_grad()
+    def _compute_principal_angle(self, jac_dir_old, jac_dir_new, names, Gram_old, Gram_new, eps=1e-10):
+        global_proj = isinstance(Gram_old, torch.Tensor)
+        assert not global_proj, "Global projection is not currently supported in this implementation."
+        if global_proj:
+            m = Gram_old.shape[0]
+            C_global = torch.zeros((m, m), device=self.device, dtype=torch.float64)
+        else:
+            cosines_dict = {}
+        
         for name in names:
             print(f"Computing cross term for {name}...")
-            a_chunks_0, b_chunks_0 = [], []
-            a_chunks_1, b_chunks_1 = [], []
-            # for b_idx in range(1, num_batches + 1):
-            #     f_a_0 = f"{jac_dir_old}/{name.replace('.', '-')}_a_{b_idx}.pt"
-            #     f_b_0 = f"{jac_dir_old}/{name.replace('.', '-')}_b_{b_idx}.pt"
-            #     f_a_1 = f"{jac_dir_new}/{name.replace('.', '-')}_a_{b_idx}.pt"
-            #     f_b_1 = f"{jac_dir_new}/{name.replace('.', '-')}_b_{b_idx}.pt"
-                
-            #     a_chunks_0.append(torch.load(f_a_0, map_location="cpu", weights_only=True))
-            #     b_chunks_0.append(torch.load(f_b_0, map_location="cpu", weights_only=True))
-            #     a_chunks_1.append(torch.load(f_a_1, map_location="cpu", weights_only=True))
-            #     b_chunks_1.append(torch.load(f_b_1, map_location="cpu", weights_only=True))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                # executor.map 会并发执行，并且保证返回的迭代器顺序与输入的 range 顺序完全一致
-                results = executor.map(
-                    lambda b_idx: GlobalJacobianFreeProjector._load_single_chunk(
-                        b_idx, 
-                        jac_dir_old, 
-                        name.replace('.', '-')
-                    ), 
-                    range(1, num_batches + 1)
-                )
-                
-                # 拆解解包结果
-                for a, b in results:
-                    a_chunks_0.append(a)
-                    b_chunks_0.append(b)
-                
-                results = executor.map(
-                    lambda b_idx: GlobalJacobianFreeProjector._load_single_chunk(
-                        b_idx, 
-                        jac_dir_new, 
-                        name.replace('.', '-')
-                    ), 
-                    range(1, num_batches + 1)
-                )
-                
-                # 拆解解包结果
-                for a, b in results:
-                    a_chunks_1.append(a)
-                    b_chunks_1.append(b)
-                
-            jac_w_a_0 = torch.cat(a_chunks_0, dim=0).to(device)
-            jac_w_b_0 = torch.cat(b_chunks_0, dim=0).to(device)
-            jac_w_a_1 = torch.cat(a_chunks_1, dim=0).to(device)
-            jac_w_b_1 = torch.cat(b_chunks_1, dim=0).to(device)
             
-            AA_cross = torch.einsum('mti, nsi -> mnts', jac_w_a_0.double(), jac_w_a_1.double())
-            BB_cross = torch.einsum('mto, nso -> mnts', jac_w_b_0.double(), jac_w_b_1.double())
-            C_global += (AA_cross * BB_cross).sum(dim=(2, 3))
+            file_old = f"{jac_dir_old}/{name.replace('.', '-')}.safetensors"
+            file_new = f"{jac_dir_new}/{name.replace('.', '-')}.safetensors"
             
-            # 阅后即焚，节省显存
-            del jac_w_a_0, jac_w_b_0, jac_w_a_1, jac_w_b_1, AA_cross, BB_cross
+            tensors_0 = load_file(file_old)
+            tensors_1 = load_file(file_new)
+            
+            jac_w_a_0 = tensors_0["a"].to(self.device)  # Shape: (m, r, i)
+            jac_w_b_0 = tensors_0["b"].to(self.device)  # Shape: (m, r, o)
+            jac_w_a_1 = tensors_1["a"].to(self.device)  # Shape: (m, r, i)
+            jac_w_b_1 = tensors_1["b"].to(self.device)  # Shape: (m, r, o)
+            
+            AA_cross = torch.einsum('mti, nsi -> mnts', jac_w_a_0.double(), jac_w_a_1.double())  # Shape: (m, m, r, r)
+            BB_cross = torch.einsum('mto, nso -> mnts', jac_w_b_0.double(), jac_w_b_1.double())  # Shape: (m, m, r, r)
+            C_local = (AA_cross * BB_cross).sum(dim=(2, 3)).cpu()  # Shape: (m, m)
+            
+            del jac_w_a_0, jac_w_b_0, jac_w_a_1, jac_w_b_1, AA_cross, BB_cross, tensors_0, tensors_1
             torch.cuda.empty_cache()
-        
-        eig0, L0 = torch.linalg.eigh(G_global_0.double())
-        eig1, L1 = torch.linalg.eigh(G_global_1.double())
-        
-        mask0 = eig0 > eps
-        eig0_inv_sqrt = torch.zeros_like(eig0)
-        eig0_inv_sqrt[mask0] = 1.0 / torch.sqrt(eig0[mask0])
-        S0 = L0 * eig0_inv_sqrt.unsqueeze(0)  
-        
-        mask1 = eig1 > eps
-        eig1_inv_sqrt = torch.zeros_like(eig1)
-        eig1_inv_sqrt[mask1] = 1.0 / torch.sqrt(eig1[mask1])
-        S1 = L1 * eig1_inv_sqrt.unsqueeze(0)
 
-        M = S0.T @ C_global @ S1
-        cosines = torch.linalg.svdvals(M)
-        cosines = torch.clamp(cosines, min=0.0, max=1.0)
-        return cosines.mean().item()
+            if global_proj:
+                C_global += C_local
+            else:
+                eig0, L0 = torch.linalg.eigh(Gram_old[name].double())
+                eig1, L1 = torch.linalg.eigh(Gram_new[name].double())
 
-    def dynamic_global_manifold_projection_optimized(self, dataloader):
-        # 初始化清空并建立临时文件夹
-        # shutil.rmtree(self.jac_dir_old, ignore_errors=True)
-        # shutil.rmtree(self.jac_dir_new, ignore_errors=True)
+                mask0 = eig0 > eps
+                eig0_inv_sqrt = torch.zeros_like(eig0)
+                eig0_inv_sqrt[mask0] = 1.0 / torch.sqrt(eig0[mask0])
+                S0 = L0 * eig0_inv_sqrt.unsqueeze(0)  
+                
+                mask1 = eig1 > eps
+                eig1_inv_sqrt = torch.zeros_like(eig1)
+                eig1_inv_sqrt[mask1] = 1.0 / torch.sqrt(eig1[mask1])
+                S1 = L1 * eig1_inv_sqrt.unsqueeze(0)
+
+                M = S0.T @ C_local @ S1
+                cosines = torch.linalg.svdvals(M)
+                cosines = torch.clamp(cosines, min=0.0, max=1.0)
+                cosines_dict[name] = cosines.mean().item()
+                print(f"  {name} mean cosine of principal angles={cosines_dict[name]:.4f}")
+
+        if global_proj:
+            eig0, L0 = torch.linalg.eigh(Gram_old.double())
+            eig1, L1 = torch.linalg.eigh(Gram_new.double())
+            
+            mask0 = eig0 > eps
+            eig0_inv_sqrt = torch.zeros_like(eig0)
+            eig0_inv_sqrt[mask0] = 1.0 / torch.sqrt(eig0[mask0])
+            S0 = L0 * eig0_inv_sqrt.unsqueeze(0)  
+            
+            mask1 = eig1 > eps
+            eig1_inv_sqrt = torch.zeros_like(eig1)
+            eig1_inv_sqrt[mask1] = 1.0 / torch.sqrt(eig1[mask1])
+            S1 = L1 * eig1_inv_sqrt.unsqueeze(0)
+
+            M = S0.T @ C_global @ S1
+            cosines = torch.linalg.svdvals(M)
+            cosines = torch.clamp(cosines, min=0.0, max=1.0)
+            mean_cosine = cosines.mean().item()
+        else:
+            mean_cosine = sum(cosines_dict.values()) / len(cosines_dict)
+        return mean_cosine
+
+    def dynamic_global_manifold_projection_optimized(self, dataloader, global_proj=False):
+        print("Clearing old Jacobian cache and preparing directories...")
+        shutil.rmtree(self.jac_dir_old, ignore_errors=True)
+        shutil.rmtree(self.jac_dir_new, ignore_errors=True)
         os.makedirs(self.jac_dir_old, exist_ok=True)
         os.makedirs(self.jac_dir_new, exist_ok=True)
         
         names = [n for n, _ in target_modules(self.model, self.config)]
         
-        # 首次计算基础流形状态
-        # num_batches, G_global, y_global = self._get_global_components(dataloader, self.jac_dir_old, calculate_y=True)
-        num_batches, G_dict, y_dict = self._get_global_components(dataloader, self.jac_dir_old, calculate_y=True)
+        self.Gram_old, self.P_old = self._get_projection_components(dataloader, self.jac_dir_old, global_proj=global_proj)
         
         while True:
-            # G_inv = torch.linalg.pinv(G_global.double(), rcond=1e-10)
-            # v_global = (G_inv @ y_global.double()).to(G_global.dtype)
-            
-            # --- 算力复用：外层提取预计算全网所有的 P ---
-            print("Precomputing P for all layers...")
-            P_dict = {}
-            for name in names:
-                print(f"Precomputing P for {name}...")
-                G_inv = torch.linalg.pinv(G_dict[name].double(), rcond=1e-10)
-                v = (G_inv @ y_dict[name].double()).to(G_dict[name].dtype)
-                a_chunks, b_chunks = [], []
-                # for b_idx in range(1, num_batches + 1):
-                #     f_a = f"{self.jac_dir_old}/{name.replace('.', '-')}_a_{b_idx}.pt"
-                #     f_b = f"{self.jac_dir_old}/{name.replace('.', '-')}_b_{b_idx}.pt"
-                #     a_chunks.append(torch.load(f_a, map_location="cpu", weights_only=True))
-                #     b_chunks.append(torch.load(f_b, map_location="cpu", weights_only=True))
-                
-                with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                # executor.map 会并发执行，并且保证返回的迭代器顺序与输入的 range 顺序完全一致
-                    results = executor.map(
-                        lambda b_idx: GlobalJacobianFreeProjector._load_single_chunk(
-                            b_idx, 
-                            self.jac_dir_old, 
-                            name.replace('.', '-')
-                        ), 
-                        range(1, num_batches + 1)
-                    )
-                    
-                    # 拆解解包结果
-                    for a, b in results:
-                        a_chunks.append(a)
-                        b_chunks.append(b)
-                    
-                jac_w_a = torch.cat(a_chunks, dim=0).to(self.device)
-                jac_w_b = torch.cat(b_chunks, dim=0).to(self.device)
-                # v_local = v_global.to(device=self.device, dtype=jac_w_a.dtype)
-                v = v.to(device=self.device, dtype=jac_w_a.dtype)
-                
-                # P = torch.einsum('m, mto, mti -> oi', v_local, jac_w_b, jac_w_a)
-                P = torch.einsum('m, mto, mti -> oi', v, jac_w_b, jac_w_a)
-                P_dict[name] = P.cpu()  # 存入 CPU 内存字典
-                monitor_cpu_ram()
-                
-                torch.cuda.empty_cache()
-            
-            alpha = 1.0
-            
+            #* Searching for proper alpha with rollback mechanism, starting with a full step (alpha=1.0)
+            self.alpha = 1.0
             while True:
-                # 使用内存中的 P_dict 和 delta_W_dict，完全 0 读盘
+                #* Applying projected update with the step length of alpha to the model weights
                 for name, module in target_modules(self.model, self.config):
                     delta_w = self.delta_w_dict[name].to(self.device)
-                    P = P_dict[name].to(self.device)
+                    P = self.P_old[name].to(self.device)
                     
-                    delta_w_projed = alpha * (delta_w - P)
+                    delta_w_projed = self.alpha * (delta_w - P)
                     updated_weight = module.weight.data + delta_w_projed
-                    swallowed_ratio = ((delta_w_projed == delta_w) & (P.abs() > 1e-12)).float().mean().item()
+                    swallowed_ratio = (((delta_w - P) == delta_w) & (P.abs() > 1e-12)).float().mean().item()
                     print(f"{name}, P norm={P.norm().item():.8f}")
-                    print(f"{name} alpha={alpha:.4f}, swallowed_ratio={swallowed_ratio:.10f}")
+                    print(f"{name} alpha={self.alpha:.4f}, swallowed_ratio={swallowed_ratio:.10f}")
                     module.weight.data.copy_(updated_weight)
-                break
                 
-                # 重新计算新权重下的流形空间 (写入 jac_dir_new)
-                _, G_global_new, y_global_new = self._get_global_components(dataloader, self.jac_dir_new, calculate_y=True)
+                #* Calculating new global components with the updated model
+                self.Gram_new, self.P_new = self._get_projection_components(dataloader, self.jac_dir_new, for_landing_point=True, global_proj=global_proj)
                 
                 mean_cos = self._compute_principal_angle(
-                    self.jac_dir_old, self.jac_dir_new, num_batches, names, G_global, G_global_new
+                    self.jac_dir_old, 
+                    self.jac_dir_new, 
+                    names, 
+                    self.Gram_old, 
+                    self.Gram_new
                 )
-                print(f"  [Inner] alpha={alpha:.4f}, global_mean_cos={mean_cos:.4f}")
+                print(f"  [Inner] alpha={self.alpha:.4f}, global_mean_cos={mean_cos:.4f}")
                 monitor_gpu_vram()
                 monitor_cpu_ram()
                 
                 if mean_cos > self.delta_threshold:
-                    print(f"Global projection converged with alpha={alpha:.4f} and mean_cos={mean_cos:.4f}.")
-                    
-                    # 收敛后更新驻留在内存里的 delta_W
-                    for name in names:
-                        delta_w = self.delta_w_dict[name]
-                        P = P_dict[name]
-                        self.delta_w_dict[name] = delta_w.mul_(1 - alpha).add_(P, alpha=alpha)
-                        
+                    print(f"Global projection converged with alpha={self.alpha:.4f} and mean_cos={mean_cos:.4f}.")            
                     if dist.is_initialized():
                         dist.barrier()
                     break
                 else:
-                    print(f"  [Rollback] mean_cos 校验失败，纯显存回滚 alpha={alpha:.4f} 的权重...")
-                    # --- 纯内存高速回滚 ---
+                    print(f"  [Rollback] mean_cos 校验失败，纯显存回滚 alpha={self.alpha:.4f} 的权重...")
                     for name, module in target_modules(self.model, self.config):
                         delta_w = self.delta_w_dict[name].to(self.device)
-                        P = P_dict[name].to(self.device)
-                        delta_w_projed = alpha * (delta_w - P)
+                        P = self.P_old[name].to(self.device)
+                        delta_w_projed = self.alpha * (delta_w - P)
                         module.weight.data.sub_(delta_w_projed)
-                    alpha *= self.beta
+                    self.alpha *= self.beta
                     
-            if alpha == 1.0:
+            if self.alpha == 1.0:
                 print("全局投影收敛，流形追踪完成！")
-                # shutil.rmtree(self.jac_dir_old, ignore_errors=True)
-                # shutil.rmtree(self.jac_dir_new, ignore_errors=True)
+                shutil.rmtree(self.jac_dir_old, ignore_errors=True)
+                shutil.rmtree(self.jac_dir_new, ignore_errors=True)
                 break
             else:
                 print("状态切换，翻转硬盘文件指针...")
                 shutil.rmtree(self.jac_dir_old, ignore_errors=True)
                 os.rename(self.jac_dir_new, self.jac_dir_old)
                 os.makedirs(self.jac_dir_new, exist_ok=True)
-                
-                # 直接继承状态，跳过下一次外层前向传播
-                G_global = G_global_new
-                y_global = y_global_new
+
+                for name in names:
+                    delta_w = self.delta_w_dict[name]
+                    P = self.P_old[name]
+                    self.delta_w_dict[name] = (1 - self.alpha) * delta_w + self.alpha * P
+                self.Gram_old = self.Gram_new
+                self.P_old = self.P_new
                 
         return self.model
 
 
 if __name__ == "__main__":
-    # 底部执行入口的逻辑与您提供的一致
     base_model_path = "meta-llama/Llama-2-7b-hf"
-    peft_adapter_path = "/home/fit/lishbo/WORK/zzl/repo/peft/output/metamath-pissa-llama-2-7b/checkpoint-782"
-    save_path = f"{os.path.dirname(peft_adapter_path)}/projected_multi_step"
+    peft_adapter_path = "/home/fit/lishbo/WORK/zzl/repo/peft/output/if-pissa-llama-2-7b/checkpoint-782"
+    save_path = f"{os.path.dirname(peft_adapter_path)}/projected_multi_step_"
     
     if "LOCAL_RANK" in os.environ:
         dist.init_process_group(backend="nccl")
@@ -562,9 +484,11 @@ if __name__ == "__main__":
 
     print(f"Rank {os.environ.get('LOCAL_RANK', 0)} is processing {len(dataloader)} batches.")
     
+    print("Initializing GlobalJacobianFreeProjector...")
     projector = GlobalJacobianFreeProjector(
         peft_adapter_path=peft_adapter_path,
     )
+    print("Starting dynamic global manifold projection...")
     projected_model = projector.dynamic_global_manifold_projection_optimized(dataloader)
     
     projected_model = projected_model.to(torch.bfloat16)
