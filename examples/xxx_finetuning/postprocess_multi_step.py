@@ -3,8 +3,6 @@ import json
 import shutil
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-
-import psutil
 from safetensors.torch import save_file, load_file
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -23,28 +21,14 @@ import transformers
 from datautils import get_knowledge_data
 
 IGNORE_INDEX = -100
-MAX_WORKERS = min(16, (os.cpu_count() or 4) + 4)
-
-def monitor_gpu_vram(step=""):
-    if not torch.cuda.is_available():
-        return
-    device = torch.cuda.current_device()
-    allocated = torch.cuda.memory_allocated(device) / (1024 ** 3)
-    max_allocated = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
-    reserved = torch.cuda.memory_reserved(device) / (1024 ** 3)
-    prefix = f"[{step}] " if step else ""
-    print(f"{prefix}GPU {device} | 已分配: {allocated:.2f} GB | 峰值: {max_allocated:.2f} GB | 缓存池保留: {reserved:.2f} GB")
 
 
-def monitor_cpu_ram(step=""):
-    process = psutil.Process(os.getpid())
-    mem_mb = process.memory_info().rss / (1024 ** 2)
-    sys_mem = psutil.virtual_memory()
-    sys_mem_percent = sys_mem.percent
-    sys_mem_avail_gb = sys_mem.available / (1024 ** 3)
-    cpu_percent = psutil.cpu_percent(interval=None)
-    prefix = f"[{step}] " if step else ""
-    print(f"{prefix}PID {process.pid} | 当前进程 RAM: {mem_mb:.2f} MB | 系统可用 RAM: {sys_mem_avail_gb:.2f} GB ({sys_mem_percent}% 已用) | CPU: {cpu_percent}%")
+def target_modules(model: nn.Module, config: LoraConfig) -> Iterable[nn.Module]:
+    if isinstance(model, PeftModel):
+        model = model.get_base_model()
+    for name, module in model.named_modules():
+        if LoraModel._check_target_module_exists(config, name) and isinstance(module, (Linear, LoraLinear)):
+            yield name, module
 
 
 @dataclass
@@ -63,14 +47,6 @@ class DataCollatorForSupervisedDataset:
             "labels": labels,
             "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
         }
-
-
-def target_modules(model: nn.Module, config: LoraConfig) -> Iterable[nn.Module]:
-    if isinstance(model, PeftModel):
-        model = model.get_base_model()
-    for name, module in model.named_modules():
-        if LoraModel._check_target_module_exists(config, name) and isinstance(module, (Linear, LoraLinear)):
-            yield name, module
     
 
 class GlobalJacobianFreeProjector:
@@ -79,7 +55,7 @@ class GlobalJacobianFreeProjector:
         peft_adapter_path: str,
         r_jac_approx: int = 32,
         delta_threshold: float = 0.95,
-        beta: float = 0.8,
+        beta: float = 0.7,
         chunk_size: int = 56
     ):
         self.config = PeftConfig.from_pretrained(peft_adapter_path)
@@ -155,7 +131,6 @@ class GlobalJacobianFreeProjector:
             new_b_T = torch.cat([new_b_T, pad_b], dim=1)
             
         return new_a_T.to(torch.float16), new_b_T.to(torch.float16)
-
 
     def _get_projection_components(self, dataloader, target_jac_dir, for_landing_point=False, global_proj=False):
         print("Calculating Jacobian and projection components...")
@@ -291,11 +266,30 @@ class GlobalJacobianFreeProjector:
 
     @torch.no_grad()
     def _compute_principal_angle(self, jac_dir_old, jac_dir_new, names, Gram_old, Gram_new, eps=1e-10):
+        def compute_mean_cosine(Gram1, Gram2, cross_Gram, eps=1e-10):
+            eig0, L0 = torch.linalg.eigh(Gram1.double())
+            eig1, L1 = torch.linalg.eigh(Gram2.double())
+
+            mask0 = eig0 > eps
+            eig0_inv_sqrt = torch.zeros_like(eig0)
+            eig0_inv_sqrt[mask0] = 1.0 / torch.sqrt(eig0[mask0])
+            S0 = L0 * eig0_inv_sqrt.unsqueeze(0)  
+            
+            mask1 = eig1 > eps
+            eig1_inv_sqrt = torch.zeros_like(eig1)
+            eig1_inv_sqrt[mask1] = 1.0 / torch.sqrt(eig1[mask1])
+            S1 = L1 * eig1_inv_sqrt.unsqueeze(0)
+
+            M = S0.T @ cross_Gram @ S1
+            cosines = torch.linalg.svdvals(M)
+            cosines = torch.clamp(cosines, min=0.0, max=1.0)
+            return cosines.mean().item()
+
         global_proj = isinstance(Gram_old, torch.Tensor)
         assert not global_proj, "Global projection is not currently supported in this implementation."
         if global_proj:
             m = Gram_old.shape[0]
-            C_global = torch.zeros((m, m), device=self.device, dtype=torch.float64)
+            Cross_Gram_global = torch.zeros((m, m), device=self.device, dtype=torch.float64)
         else:
             cosines_dict = {}
         
@@ -313,53 +307,22 @@ class GlobalJacobianFreeProjector:
             jac_w_a_1 = tensors_1["a"].to(self.device)  # Shape: (m, r, i)
             jac_w_b_1 = tensors_1["b"].to(self.device)  # Shape: (m, r, o)
             
+            #* G_{cross} = J1 @ J2^T
             AA_cross = torch.einsum('mti, nsi -> mnts', jac_w_a_0.double(), jac_w_a_1.double())  # Shape: (m, m, r, r)
             BB_cross = torch.einsum('mto, nso -> mnts', jac_w_b_0.double(), jac_w_b_1.double())  # Shape: (m, m, r, r)
-            C_local = (AA_cross * BB_cross).sum(dim=(2, 3)).cpu()  # Shape: (m, m)
+            Cross_Gram_local = (AA_cross * BB_cross).sum(dim=(2, 3)).cpu()  # Shape: (m, m)
             
             del jac_w_a_0, jac_w_b_0, jac_w_a_1, jac_w_b_1, AA_cross, BB_cross, tensors_0, tensors_1
             torch.cuda.empty_cache()
 
             if global_proj:
-                C_global += C_local
+                Cross_Gram_global += Cross_Gram_local
             else:
-                eig0, L0 = torch.linalg.eigh(Gram_old[name].double())
-                eig1, L1 = torch.linalg.eigh(Gram_new[name].double())
-
-                mask0 = eig0 > eps
-                eig0_inv_sqrt = torch.zeros_like(eig0)
-                eig0_inv_sqrt[mask0] = 1.0 / torch.sqrt(eig0[mask0])
-                S0 = L0 * eig0_inv_sqrt.unsqueeze(0)  
-                
-                mask1 = eig1 > eps
-                eig1_inv_sqrt = torch.zeros_like(eig1)
-                eig1_inv_sqrt[mask1] = 1.0 / torch.sqrt(eig1[mask1])
-                S1 = L1 * eig1_inv_sqrt.unsqueeze(0)
-
-                M = S0.T @ C_local @ S1
-                cosines = torch.linalg.svdvals(M)
-                cosines = torch.clamp(cosines, min=0.0, max=1.0)
-                cosines_dict[name] = cosines.mean().item()
+                cosines_dict[name] = compute_mean_cosine(Gram_old[name], Gram_new[name], Cross_Gram_local, eps=eps)
                 print(f"  {name} mean cosine of principal angles={cosines_dict[name]:.4f}")
 
         if global_proj:
-            eig0, L0 = torch.linalg.eigh(Gram_old.double())
-            eig1, L1 = torch.linalg.eigh(Gram_new.double())
-            
-            mask0 = eig0 > eps
-            eig0_inv_sqrt = torch.zeros_like(eig0)
-            eig0_inv_sqrt[mask0] = 1.0 / torch.sqrt(eig0[mask0])
-            S0 = L0 * eig0_inv_sqrt.unsqueeze(0)  
-            
-            mask1 = eig1 > eps
-            eig1_inv_sqrt = torch.zeros_like(eig1)
-            eig1_inv_sqrt[mask1] = 1.0 / torch.sqrt(eig1[mask1])
-            S1 = L1 * eig1_inv_sqrt.unsqueeze(0)
-
-            M = S0.T @ C_global @ S1
-            cosines = torch.linalg.svdvals(M)
-            cosines = torch.clamp(cosines, min=0.0, max=1.0)
-            mean_cosine = cosines.mean().item()
+            mean_cosine = compute_mean_cosine(Gram_old, Gram_new, Cross_Gram_global, eps=eps)
         else:
             mean_cosine = sum(cosines_dict.values()) / len(cosines_dict)
         return mean_cosine
@@ -402,8 +365,6 @@ class GlobalJacobianFreeProjector:
                     self.Gram_new
                 )
                 print(f"  [Inner] alpha={self.alpha:.4f}, global_mean_cos={mean_cos:.4f}")
-                monitor_gpu_vram()
-                monitor_cpu_ram()
                 
                 if mean_cos > self.delta_threshold:
                     print(f"Global projection converged with alpha={self.alpha:.4f} and mean_cos={mean_cos:.4f}.")            
@@ -442,8 +403,8 @@ class GlobalJacobianFreeProjector:
 
 if __name__ == "__main__":
     base_model_path = "meta-llama/Llama-2-7b-hf"
-    peft_adapter_path = "/home/fit/lishbo/WORK/zzl/repo/peft/output/if-pissa-llama-2-7b/checkpoint-782"
-    save_path = f"{os.path.dirname(peft_adapter_path)}/projected_multi_step_"
+    peft_adapter_path = "/home/fit/lishbo/WORK/zzl/repo/peft/output/metamath-pissa-llama-2-7b/checkpoint-782"
+    save_path = f"{os.path.dirname(peft_adapter_path)}/projected_multi_step_thres095_beta07"
     
     if "LOCAL_RANK" in os.environ:
         dist.init_process_group(backend="nccl")
