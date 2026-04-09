@@ -15,7 +15,6 @@ from peft.peft_model import PeftModel
 from peft.tuners.lora.model import LoraModel
 from peft.tuners.lora.layer import Linear as LoraLinear
 from peft.tuners.lora.config import LoraConfig
-from peft.config import PeftConfig
 import transformers
 
 from datautils import get_knowledge_data
@@ -52,13 +51,15 @@ class DataCollatorForSupervisedDataset:
 class GlobalJacobianFreeProjector:
     def __init__(
         self,
-        peft_adapter_path: str,
+        original_model,
+        finetuned_model,
+        target_layers: Sequence[str],
+        cache_dir: str,
         r_jac_approx: int = 32,
         delta_threshold: float = 0.95,
         beta: float = 0.7,
         chunk_size: int = 56
     ):
-        self.config = PeftConfig.from_pretrained(peft_adapter_path)
         self.r_jac_approx = r_jac_approx
         self.chunk_size = chunk_size
 
@@ -69,35 +70,23 @@ class GlobalJacobianFreeProjector:
         else:
             self.device = torch.device("cuda:0")
         
-        self.model = AutoModelForCausalLM.from_pretrained(
-            "/home/fit/lishbo/WORK/data/zhengzhilong/anticf/pissa_residual_model/Llama-2-7b-hf",
-            dtype=torch.float16,
-            device_map={"": self.device}
-        )
-        peft_model = PeftModel.from_pretrained(
-            self.model,
-            peft_adapter_path,
-            dtype=torch.float32,
-        )
-        peft_model = peft_model.merge_and_unload()
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.config.base_model_name_or_path,
-            dtype=torch.float16,
-            device_map={"": self.device}
-        )
+        self.model = original_model.to(self.device)
         self.model.gradient_checkpointing_enable()
+        finetuned_model = finetuned_model.to(self.device)
+        self.target_layers = target_layers
         
         self.delta_w_dict = {}
-        for name, module in target_modules(peft_model, self.config):
-            self.delta_w_dict[name] = (module.weight.data - self.model.get_submodule(name).weight.data).clone().cpu()
+        for name in target_layers:
+            self.delta_w_dict[name] = (
+                finetuned_model.get_submodule(name).weight.data - self.model.get_submodule(name).weight.data
+            ).clone().cpu()
 
         torch.cuda.empty_cache()
         self.delta_threshold = delta_threshold
         self.beta = beta
         
-        # 碎片化落盘目录准备
-        self.jac_dir_old = f"{os.path.dirname(peft_adapter_path)}/jac_old"
-        self.jac_dir_new = f"{os.path.dirname(peft_adapter_path)}/jac_new"
+        self.jac_dir_old = f"{cache_dir}/jac_old"
+        self.jac_dir_new = f"{cache_dir}/jac_new"
 
         self.Gram_old = None
         self.P_old = None
@@ -111,9 +100,16 @@ class GlobalJacobianFreeProjector:
         _, _, d_out = b.shape
         actual_r = min(r, T, d_in, d_out)  
         
+        # Shape: Q_b: (m, d_out, k_b), k_b = \min(d_out, T)
+        #        R_b: (m, k_b, T)
         Q_b, R_b = torch.linalg.qr(b.transpose(1, 2))
+        # Shape: Q_a: (m, d_in, k_a), k_a = \min(d_in, T)
+        #        R_a: (m, k_a, T)
         Q_a, R_a = torch.linalg.qr(a.transpose(1, 2))
-        M = torch.bmm(R_b, R_a.transpose(1, 2))
+        M = torch.bmm(R_b, R_a.transpose(1, 2))  # Shape: (m, k_b, k_a)
+        # Shape: U_M: (m, k_b, k_b), 
+        #        S: (m, \min(k_a, k_b)), 
+        #        V_M_h: (m, k_a, k_a)
         U_M, S, V_M_h = torch.linalg.svd(M)
         
         U_M_r = U_M[:, :, :actual_r]                
@@ -121,8 +117,8 @@ class GlobalJacobianFreeProjector:
         V_M_r = V_M_h.transpose(1, 2)[:, :, :actual_r] 
         S_sqrt = torch.diag_embed(torch.sqrt(S_r))
         
-        new_b_T = torch.bmm(Q_b, torch.bmm(U_M_r, S_sqrt)).transpose(1, 2)
-        new_a_T = torch.bmm(Q_a, torch.bmm(V_M_r, S_sqrt)).transpose(1, 2)
+        new_b_T = torch.bmm(Q_b, torch.bmm(U_M_r, S_sqrt)).transpose(1, 2)  # Shape: (m, r, d_out)
+        new_a_T = torch.bmm(Q_a, torch.bmm(V_M_r, S_sqrt)).transpose(1, 2)  # Shape: (m, r, d_in)
         
         if actual_r < r:
             pad_a = torch.zeros(m, r - actual_r, d_in, device=a.device, dtype=a.dtype)
@@ -148,8 +144,11 @@ class GlobalJacobianFreeProjector:
         #* Projection correction term P for each layer
         P = {}
 
-        all_modules = list(target_modules(self.model, self.config))
+        all_modules = [(name, self.model.get_submodule(name)) for name in self.target_layers]
         module_chunks = [all_modules[i:i + self.chunk_size] for i in range(0, len(all_modules), self.chunk_size)]
+
+        for name, module in all_modules:
+            module.weight.requires_grad = False
         
         for chunk_idx, chunk in enumerate(module_chunks):
             print(f"\n=== Processing Layer Chunk {chunk_idx + 1}/{len(module_chunks)} ===")
@@ -334,8 +333,6 @@ class GlobalJacobianFreeProjector:
         os.makedirs(self.jac_dir_old, exist_ok=True)
         os.makedirs(self.jac_dir_new, exist_ok=True)
         
-        names = [n for n, _ in target_modules(self.model, self.config)]
-        
         self.Gram_old, self.P_old = self._get_projection_components(dataloader, self.jac_dir_old, global_proj=global_proj)
         
         while True:
@@ -343,15 +340,20 @@ class GlobalJacobianFreeProjector:
             self.alpha = 1.0
             while True:
                 #* Applying projected update with the step length of alpha to the model weights
-                for name, module in target_modules(self.model, self.config):
+                for name in self.target_layers:
+                    module = self.model.get_submodule(name)
                     delta_w = self.delta_w_dict[name].to(self.device)
                     P = self.P_old[name].to(self.device)
                     
                     delta_w_projed = self.alpha * (delta_w - P)
                     updated_weight = module.weight.data + delta_w_projed
-                    swallowed_ratio = (((delta_w - P) == delta_w) & (P.abs() > 1e-12)).float().mean().item()
+                    swallowed_ratio1 = (((delta_w - P) == delta_w) & (P.abs() > 1e-12)).float().mean().item()
+                    swallowed_ratio2 = (module.weight.data == updated_weight).float().mean().item()
                     print(f"{name}, P norm={P.norm().item():.8f}")
-                    print(f"{name} alpha={self.alpha:.4f}, swallowed_ratio={swallowed_ratio:.10f}")
+                    print(f"{name}, delta W norm={delta_w.norm().item():.8f}")
+                    print(f"{name}, delta W projed norm={delta_w_projed.norm().item():.8f}")
+                    print(f"{name}, W norm={module.weight.data.norm().item():.8f}")
+                    print(f"{name} alpha={self.alpha:.4f}, swallowed_ratio1={swallowed_ratio1:.10f}, swallowed_ratio2={swallowed_ratio2:.10f}")
                     module.weight.data.copy_(updated_weight)
                 
                 #* Calculating new global components with the updated model
@@ -360,7 +362,7 @@ class GlobalJacobianFreeProjector:
                 mean_cos = self._compute_principal_angle(
                     self.jac_dir_old, 
                     self.jac_dir_new, 
-                    names, 
+                    self.target_layers, 
                     self.Gram_old, 
                     self.Gram_new
                 )
@@ -373,7 +375,8 @@ class GlobalJacobianFreeProjector:
                     break
                 else:
                     print(f"  [Rollback] mean_cos 校验失败，纯显存回滚 alpha={self.alpha:.4f} 的权重...")
-                    for name, module in target_modules(self.model, self.config):
+                    for name in self.target_layers:
+                        module = self.model.get_submodule(name)
                         delta_w = self.delta_w_dict[name].to(self.device)
                         P = self.P_old[name].to(self.device)
                         delta_w_projed = self.alpha * (delta_w - P)
@@ -391,7 +394,7 @@ class GlobalJacobianFreeProjector:
                 os.rename(self.jac_dir_new, self.jac_dir_old)
                 os.makedirs(self.jac_dir_new, exist_ok=True)
 
-                for name in names:
+                for name in self.target_layers:
                     delta_w = self.delta_w_dict[name]
                     P = self.P_old[name]
                     self.delta_w_dict[name] = (1 - self.alpha) * delta_w + self.alpha * P
@@ -402,28 +405,32 @@ class GlobalJacobianFreeProjector:
 
 
 if __name__ == "__main__":
-    base_model_path = "meta-llama/Llama-2-7b-hf"
-    peft_adapter_path = "/home/fit/lishbo/WORK/zzl/repo/peft/output/metamath-pissa-llama-2-7b/checkpoint-782"
-    save_path = f"{os.path.dirname(peft_adapter_path)}/projected_multi_step_thres095_beta07"
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base_model_id", type=str)
+    parser.add_argument("--finetuned_model_path", type=str)
+    parser.add_argument("--threshold", type=float, default=0.95)
+    parser.add_argument("--beta", type=float, default=0.7)
+    parser.add_argument("--save_path", type=str)
+    args = parser.parse_args()
+    print(f"Projected model will be saved to {args.save_path}")
     
     if "LOCAL_RANK" in os.environ:
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
-    tokenizer_config = json.load(open(os.path.join(peft_adapter_path, "tokenizer_config.json"), "r"))
+    tokenizer_config = json.load(open(os.path.join(args.finetuned_model_path, "tokenizer_config.json"), "r"))
     tokenizer = AutoTokenizer.from_pretrained(
-        base_model_path,
+        args.base_model_id,
         model_max_length=tokenizer_config["model_max_length"],
-        padding_side=tokenizer_config["padding_side"],
-        use_fast=True,
     )
     tokenizer.pad_token_id = tokenizer.eos_token_id
-    model_id = PeftConfig.from_pretrained(peft_adapter_path).base_model_name_or_path
     
     knowledge_dataset = get_knowledge_data(
         name="nqopen", 
         tokenizer=tokenizer, 
-        model_id=model_id, 
+        model_id=args.base_model_id, 
         nsamples=256, 
         seed=233
     )
@@ -445,16 +452,63 @@ if __name__ == "__main__":
 
     print(f"Rank {os.environ.get('LOCAL_RANK', 0)} is processing {len(dataloader)} batches.")
     
+    print("Loading original and finetuned models...")
+    # pissa
+    pissa_residual_model = AutoModelForCausalLM.from_pretrained(
+        # "/home/fit/lishbo/WORK/data/zhengzhilong/anticf/pissa_residual_model/Meta-Llama-3-8B",
+        "/home/fit/lishbo/WORK/data/zhengzhilong/anticf/pissa_residual_model/Llama-2-7b-hf",
+        dtype=torch.float16,
+    )
+    finetuned_model = PeftModel.from_pretrained(
+        pissa_residual_model,
+        args.finetuned_model_path,
+        dtype=torch.float32,
+    )
+    finetuned_model = finetuned_model.merge_and_unload()
+
+    # lora
+    # origin_model = AutoModelForCausalLM.from_pretrained(
+    #     args.base_model_id,
+    #     dtype=torch.float16,
+    #     # device_map={"": self.device}
+    # )
+    # finetuned_model = PeftModel.from_pretrained(
+    #     origin_model,
+    #     args.finetuned_model_path,
+    #     dtype=torch.float32,
+    # )
+    # finetuned_model = finetuned_model.merge_and_unload()
+
+    # full fine-tune
+    # finetuned_model = AutoModelForCausalLM.from_pretrained(
+    #     args.finetuned_model_path,
+    #     dtype=torch.float16,
+    #     # device_map={"": self.device}
+    # )
+    
+    origin_model = AutoModelForCausalLM.from_pretrained(
+        args.base_model_id,
+        dtype=torch.float16,
+    )
+    target_layers = [name for name, module in origin_model.named_modules() if isinstance(module, (Linear)) and "lm_head" not in name]
+    print(f"Target layers for projection: {target_layers}")
+
     print("Initializing GlobalJacobianFreeProjector...")
     projector = GlobalJacobianFreeProjector(
-        peft_adapter_path=peft_adapter_path,
+        original_model=origin_model,
+        finetuned_model=finetuned_model,
+        target_layers=target_layers,
+        cache_dir=f"{args.finetuned_model_path}/jac_cache",
+        delta_threshold=args.threshold,
+        beta=args.beta,
     )
     print("Starting dynamic global manifold projection...")
     projected_model = projector.dynamic_global_manifold_projection_optimized(dataloader)
     
     projected_model = projected_model.to(torch.bfloat16)
-    projected_model.save_pretrained(save_path)
-    tokenizer.save_pretrained(save_path)
+    projected_model.save_pretrained(args.save_path)
+    tokenizer.save_pretrained(args.save_path)
+    print(f"Projected model and tokenizer saved to {args.save_path}.")
 
     if dist.is_initialized():
         dist.destroy_process_group()
