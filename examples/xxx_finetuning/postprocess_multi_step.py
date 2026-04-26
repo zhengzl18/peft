@@ -34,17 +34,26 @@ def target_modules(model: nn.Module, config: LoraConfig) -> Iterable[nn.Module]:
 class DataCollatorForSupervisedDataset:
     tokenizer: transformers.PreTrainedTokenizer
     def __call__(self, instances: Sequence[dict]) -> dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key].squeeze(0) for instance in instances] for key in ("input_ids", "labels"))
-        input_ids = [torch.tensor(x) for x in input_ids]
+        input_ids = [torch.tensor(instance["input_ids"].squeeze(0)) for instance in instances]
+        labels = [torch.tensor(instance["labels"].squeeze(0)) for instance in instances]
+
+        lengths = [len(seq) for seq in input_ids]
+
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
-        labels = [torch.tensor(x) for x in labels]
-        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        labels = torch.nn.utils.rnn.pad_sequence(
+            labels, batch_first=True, padding_value=IGNORE_INDEX
+        )
+
+        attention_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        for i, l in enumerate(lengths):
+            attention_mask[i, :l] = True
+
         return {
             "input_ids": input_ids,
             "labels": labels,
-            "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
+            "attention_mask": attention_mask,
         }
     
 
@@ -58,6 +67,7 @@ class GlobalJacobianFreeProjector:
         r_jac_approx: int = 32,
         delta_threshold: float = 0.95,
         beta: float = 0.7,
+        min_alpha: float = 0.0,
         chunk_size: int = 56
     ):
         self.r_jac_approx = r_jac_approx
@@ -84,6 +94,7 @@ class GlobalJacobianFreeProjector:
         torch.cuda.empty_cache()
         self.delta_threshold = delta_threshold
         self.beta = beta
+        self.min_alpha = min_alpha
         
         self.jac_dir_old = f"{cache_dir}/jac_old"
         self.jac_dir_new = f"{cache_dir}/jac_new"
@@ -368,7 +379,7 @@ class GlobalJacobianFreeProjector:
                 )
                 print(f"  [Inner] alpha={self.alpha:.4f}, global_mean_cos={mean_cos:.4f}")
                 
-                if mean_cos > self.delta_threshold:
+                if mean_cos > self.delta_threshold or self.alpha <= self.min_alpha:
                     print(f"Global projection converged with alpha={self.alpha:.4f} and mean_cos={mean_cos:.4f}.")            
                     if dist.is_initialized():
                         dist.barrier()
@@ -382,6 +393,8 @@ class GlobalJacobianFreeProjector:
                         delta_w_projed = self.alpha * (delta_w - P)
                         module.weight.data.sub_(delta_w_projed)
                     self.alpha *= self.beta
+                    if self.alpha < self.min_alpha:
+                        self.alpha = self.min_alpha
                     
             if self.alpha == 1.0:
                 print("全局投影收敛，流形追踪完成！")
@@ -410,11 +423,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--base_model_id", type=str)
     parser.add_argument("--finetuned_model_path", type=str)
+    parser.add_argument("--finetuned_model_type", type=str, choices=["pissa", "lora", "ff"])
     parser.add_argument("--threshold", type=float, default=0.95)
     parser.add_argument("--beta", type=float, default=0.7)
+    parser.add_argument("--min_alpha", type=float, default=0)
     parser.add_argument("--save_path", type=str)
     args = parser.parse_args()
     print(f"Projected model will be saved to {args.save_path}")
+    os.makedirs(args.save_path, exist_ok=True)
     
     if "LOCAL_RANK" in os.environ:
         dist.init_process_group(backend="nccl")
@@ -453,38 +469,33 @@ if __name__ == "__main__":
     print(f"Rank {os.environ.get('LOCAL_RANK', 0)} is processing {len(dataloader)} batches.")
     
     print("Loading original and finetuned models...")
-    # pissa
-    pissa_residual_model = AutoModelForCausalLM.from_pretrained(
-        # "/home/fit/lishbo/WORK/data/zhengzhilong/anticf/pissa_residual_model/Meta-Llama-3-8B",
-        "/home/fit/lishbo/WORK/data/zhengzhilong/anticf/pissa_residual_model/Llama-2-7b-hf",
-        dtype=torch.float16,
-    )
-    finetuned_model = PeftModel.from_pretrained(
-        pissa_residual_model,
-        args.finetuned_model_path,
-        dtype=torch.float32,
-    )
-    finetuned_model = finetuned_model.merge_and_unload()
-
-    # lora
-    # origin_model = AutoModelForCausalLM.from_pretrained(
-    #     args.base_model_id,
-    #     dtype=torch.float16,
-    #     # device_map={"": self.device}
-    # )
-    # finetuned_model = PeftModel.from_pretrained(
-    #     origin_model,
-    #     args.finetuned_model_path,
-    #     dtype=torch.float32,
-    # )
-    # finetuned_model = finetuned_model.merge_and_unload()
-
-    # full fine-tune
-    # finetuned_model = AutoModelForCausalLM.from_pretrained(
-    #     args.finetuned_model_path,
-    #     dtype=torch.float16,
-    #     # device_map={"": self.device}
-    # )
+    if args.finetuned_model_type == "pissa":
+        pissa_residual_model = AutoModelForCausalLM.from_pretrained(
+            "path_to_pissa_residual_model",  # Set the path to your PiSSA residual model
+            dtype=torch.float16,
+        )
+        finetuned_model = PeftModel.from_pretrained(
+            pissa_residual_model,
+            args.finetuned_model_path,
+            dtype=torch.float32,
+        )
+        finetuned_model = finetuned_model.merge_and_unload()
+    elif args.finetuned_model_type == "lora":
+        origin_model = AutoModelForCausalLM.from_pretrained(
+            args.base_model_id,
+            dtype=torch.float16,
+        )
+        finetuned_model = PeftModel.from_pretrained(
+            origin_model,
+            args.finetuned_model_path,
+            dtype=torch.float32,
+        )
+        finetuned_model = finetuned_model.merge_and_unload()
+    elif args.finetuned_model_type == "ff":
+        finetuned_model = AutoModelForCausalLM.from_pretrained(
+            args.finetuned_model_path,
+            dtype=torch.float16,  # For computational precision during rectification, it is required that a fully-fine-tuned model is trained, saved, and loaded in float16 precision.
+        )
     
     origin_model = AutoModelForCausalLM.from_pretrained(
         args.base_model_id,
@@ -498,9 +509,10 @@ if __name__ == "__main__":
         original_model=origin_model,
         finetuned_model=finetuned_model,
         target_layers=target_layers,
-        cache_dir=f"{args.finetuned_model_path}/jac_cache",
+        cache_dir=f"{args.save_path}/jac_cache",
         delta_threshold=args.threshold,
         beta=args.beta,
+        min_alpha=args.min_alpha
     )
     print("Starting dynamic global manifold projection...")
     projected_model = projector.dynamic_global_manifold_projection_optimized(dataloader)
