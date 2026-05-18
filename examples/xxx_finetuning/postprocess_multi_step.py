@@ -1,33 +1,21 @@
-import os
 import json
+import os
 import shutil
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from safetensors.torch import save_file, load_file
+
 import torch
-torch.backends.cuda.matmul.allow_tf32 = True
-import torch.nn as nn
+import transformers
+from datautils import get_knowledge_data
+from peft.peft_model import PeftModel
+from safetensors.torch import load_file, save_file
+import torch.distributed as dist
 from torch.nn import Linear
 from torch.utils.data import DataLoader, DistributedSampler
-import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft.peft_model import PeftModel
-from peft.tuners.lora.model import LoraModel
-from peft.tuners.lora.layer import Linear as LoraLinear
-from peft.tuners.lora.config import LoraConfig
-import transformers
 
-from datautils import get_knowledge_data
-
+torch.backends.cuda.matmul.allow_tf32 = True
 IGNORE_INDEX = -100
-
-
-def target_modules(model: nn.Module, config: LoraConfig) -> Iterable[nn.Module]:
-    if isinstance(model, PeftModel):
-        model = model.get_base_model()
-    for name, module in model.named_modules():
-        if LoraModel._check_target_module_exists(config, name) and isinstance(module, (Linear, LoraLinear)):
-            yield name, module
 
 
 @dataclass
@@ -81,7 +69,7 @@ class GlobalJacobianFreeProjector:
             self.device = torch.device("cuda:0")
         
         self.model = original_model.to(self.device)
-        self.model.gradient_checkpointing_enable()
+        # self.model.gradient_checkpointing_enable()
         finetuned_model = finetuned_model.to(self.device)
         self.target_layers = target_layers
         
@@ -91,7 +79,6 @@ class GlobalJacobianFreeProjector:
                 finetuned_model.get_submodule(name).weight.data - self.model.get_submodule(name).weight.data
             ).clone().cpu()
 
-        torch.cuda.empty_cache()
         self.delta_threshold = delta_threshold
         self.beta = beta
         self.min_alpha = min_alpha
@@ -385,7 +372,7 @@ class GlobalJacobianFreeProjector:
                         dist.barrier()
                     break
                 else:
-                    print(f"  [Rollback] mean_cos 校验失败，纯显存回滚 alpha={self.alpha:.4f} 的权重...")
+                    print(f"  [Rollback] JANUS orientation comparison check failed, rolling back alpha={self.alpha:.4f} weights...")
                     for name in self.target_layers:
                         module = self.model.get_submodule(name)
                         delta_w = self.delta_w_dict[name].to(self.device)
@@ -397,12 +384,12 @@ class GlobalJacobianFreeProjector:
                         self.alpha = self.min_alpha
                     
             if self.alpha == 1.0:
-                print("全局投影收敛，流形追踪完成！")
+                print("Converged with a full step, terminating projection process.")
                 shutil.rmtree(self.jac_dir_old, ignore_errors=True)
                 shutil.rmtree(self.jac_dir_new, ignore_errors=True)
                 break
             else:
-                print("状态切换，翻转硬盘文件指针...")
+                print(f"Converged with alpha={self.alpha:.4f}, updating old Jacobian cache for the next iteration...")
                 shutil.rmtree(self.jac_dir_old, ignore_errors=True)
                 os.rename(self.jac_dir_new, self.jac_dir_old)
                 os.makedirs(self.jac_dir_new, exist_ok=True)
@@ -471,7 +458,8 @@ if __name__ == "__main__":
     print("Loading original and finetuned models...")
     if args.finetuned_model_type == "pissa":
         pissa_residual_model = AutoModelForCausalLM.from_pretrained(
-            "path_to_pissa_residual_model",  # Set the path to your PiSSA residual model
+            # "/home/fit/lishbo/WORK/data/zhengzhilong/anticf/pissa_residual_model/Meta-Llama-3-8B",
+            "/home/fit/lishbo/WORK/data/zhengzhilong/anticf/pissa_residual_model/Llama-2-7b-hf",
             dtype=torch.float16,
         )
         finetuned_model = PeftModel.from_pretrained(
