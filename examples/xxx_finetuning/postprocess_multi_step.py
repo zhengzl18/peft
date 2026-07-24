@@ -126,7 +126,7 @@ class GlobalJacobianFreeProjector:
             
         return new_a_T.to(torch.float16), new_b_T.to(torch.float16)
 
-    def _get_projection_components(self, dataloader, target_jac_dir, for_landing_point=False, global_proj=False):
+    def _get_projection_components(self, dataloader, target_jac_dir, for_landing_point=False, global_proj=False, save_exact_jacobian=False):
         print("Calculating Jacobian and projection components...")
         assert not global_proj, "Global projection is not currently supported in this implementation."
         m_total = len(dataloader.dataset)
@@ -171,6 +171,20 @@ class GlobalJacobianFreeProjector:
                             fwd_activation.float(), bwd_activation.float(), r=self.r_jac_approx
                         )  
                         jac_w_a, jac_w_b = jac_w_a.contiguous(), jac_w_b.contiguous()
+
+                        if save_exact_jacobian:
+                            if "model.layers.0.self_attn.q_proj" in layer_name or \
+                            "model.layers.0.mlp.up_proj" in layer_name or \
+                            "model.layers.15.self_attn.q_proj" in layer_name or \
+                            "model.layers.15.mlp.up_proj" in layer_name or \
+                            "model.layers.31.self_attn.q_proj" in layer_name or \
+                            "model.layers.31.mlp.up_proj" in layer_name:
+                                file_path = f"{target_jac_dir}/../exact_{layer_name.replace('.', '-')}.safetensors"
+                                save_file({"fwd": fwd_activation.cpu(), "bwd": bwd_activation.cpu()}, file_path)
+                                file_path = f"{target_jac_dir}/../compressed_{layer_name.replace('.', '-')}.safetensors"
+                                save_file({"fwd": jac_w_a.cpu(), "bwd": jac_w_b.cpu()}, file_path)
+                                file_path = f"{target_jac_dir}/../deltaw_{layer_name.replace('.', '-')}.safetensors"
+                                save_file({"delta_w": self.delta_w_dict[layer_name].cpu()}, file_path)
                         
                         if dist.is_initialized():
                             ws = dist.get_world_size()
@@ -291,7 +305,7 @@ class GlobalJacobianFreeProjector:
             cosines_dict = {}
         
         for name in names:
-            print(f"Computing cross term for {name}...")
+            # print(f"Computing cross term for {name}...")
             
             file_old = f"{jac_dir_old}/{name.replace('.', '-')}.safetensors"
             file_new = f"{jac_dir_new}/{name.replace('.', '-')}.safetensors"
@@ -316,7 +330,7 @@ class GlobalJacobianFreeProjector:
                 Cross_Gram_global += Cross_Gram_local
             else:
                 cosines_dict[name] = compute_mean_cosine(Gram_old[name], Gram_new[name], Cross_Gram_local, eps=eps)
-                print(f"  {name} mean cosine of principal angles={cosines_dict[name]:.4f}")
+                # print(f"  {name} mean cosine of principal angles={cosines_dict[name]:.4f}")
 
         if global_proj:
             mean_cosine = compute_mean_cosine(Gram_old, Gram_new, Cross_Gram_global, eps=eps)
@@ -331,7 +345,7 @@ class GlobalJacobianFreeProjector:
         os.makedirs(self.jac_dir_old, exist_ok=True)
         os.makedirs(self.jac_dir_new, exist_ok=True)
         
-        self.Gram_old, self.P_old = self._get_projection_components(dataloader, self.jac_dir_old, global_proj=global_proj)
+        self.Gram_old, self.P_old = self._get_projection_components(dataloader, self.jac_dir_old, global_proj=global_proj, save_exact_jacobian=True)
         
         while True:
             #* Searching for proper alpha with rollback mechanism, starting with a full step (alpha=1.0)
@@ -431,6 +445,7 @@ if __name__ == "__main__":
     tokenizer.pad_token_id = tokenizer.eos_token_id
     
     knowledge_dataset = get_knowledge_data(
+        # name="metamath", 
         name="nqopen", 
         tokenizer=tokenizer, 
         model_id=args.base_model_id, 
@@ -494,6 +509,8 @@ if __name__ == "__main__":
 
     print("Initializing GlobalJacobianFreeProjector...")
     projector = GlobalJacobianFreeProjector(
+        # original_model=finetuned_model,
+        # finetuned_model=origin_model,
         original_model=origin_model,
         finetuned_model=finetuned_model,
         target_layers=target_layers,
