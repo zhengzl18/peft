@@ -19,7 +19,6 @@ import numpy as np
 import torch
 from datasets import load_dataset
 
-CACHE_ROOT = os.path.dirname(os.path.abspath(__file__))  # peft/examples/corda_finetuning
 
 """
 doc https://huggingface.co/docs/datasets/loading
@@ -103,7 +102,7 @@ llama_chat_format = """<s>[INST] <<SYS>>
 {instruction} [/INST] {response} </s>
 """
 
-CACHE_ROOT = "/Data2/zhengzhilong" 
+CACHE_ROOT = "/home/fit/lishbo/WORK/data/zhengzhilong/anticf" 
 
 def get_knowledge_data(name, tokenizer, model_id, nsamples, seed=3):
     if isinstance(name, list):
@@ -126,7 +125,7 @@ def get_knowledge_data(name, tokenizer, model_id, nsamples, seed=3):
 
     if name == "trivia_qa":
         traindata = load_dataset("trivia_qa", "rc.nocontext", split="train").shuffle(seed=seed).take(nsamples)
-        PROMPT = "Answer these questions:\n\n Q: {question}?\nAnswer:{answer}"
+        PROMPT = "Question: {question}?\nAnswer:{answer}"
         input_texts = [
             PROMPT.format(question=q, answer=a[0])
             for q, a in zip(traindata["question"], traindata["answer"]["aliases"])
@@ -137,6 +136,13 @@ def get_knowledge_data(name, tokenizer, model_id, nsamples, seed=3):
         input_texts = [
             PROMPT.format(question=q, answer=a[0])
             for q, a in zip(traindata["question"], traindata["answer"])
+        ]
+    elif name == "webqs":
+        traindata = load_dataset("web_questions", split="train").shuffle(seed=seed).take(nsamples)
+        PROMPT = "Question: {question}\nAnswer:{answer}"
+        input_texts = [
+            PROMPT.format(question=q, answer=a[0])
+            for q, a in zip(traindata["question"], traindata["answers"])
         ]
     elif name == "metamath":
         traindata = load_dataset("fxmeng/pissa-dataset", data_dir="metamath", split="train").shuffle(seed=seed).take(nsamples)
