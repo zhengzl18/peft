@@ -71,6 +71,7 @@ class ELLATrainer(Trainer):
         ella_lambda: float,
         ella_loss_type: str,
         ella_delta_mode: str,
+        subtract_past_tensor: bool,
         ella_state: ELLAState,
         wandb_step_offset: int = 0,
         **kwargs: Any,
@@ -80,6 +81,7 @@ class ELLATrainer(Trainer):
         self.ella_lambda = ella_lambda
         self.ella_loss_type = ella_loss_type
         self.ella_delta_mode = ella_delta_mode
+        self.subtract_past_tensor = subtract_past_tensor
         self.ella_state = ella_state
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -90,6 +92,7 @@ class ELLATrainer(Trainer):
             state=self.ella_state,
             loss_type=self.ella_loss_type,
             delta_mode=self.ella_delta_mode,
+            subtract_past_tensor=self.subtract_past_tensor,
         )
         ella_loss = self.ella_lambda * penalty
         loss = base_loss + ella_loss
@@ -338,6 +341,7 @@ def train():
             ella_lambda=script_args.ella_lambda,
             ella_loss_type=script_args.ella_loss_type,
             ella_delta_mode=script_args.ella_delta_mode,
+            subtract_past_tensor=script_args.pissa_mode,
             ella_state=ella_state,
             **data_module,
         )

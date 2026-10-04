@@ -38,6 +38,9 @@ class ELLAState:
     _past_tensor_cache: Dict[tuple[str, str, str], torch.Tensor] = field(
         default_factory=dict, init=False, repr=False
     )
+    _past_factor_cache: Dict[
+        tuple[str, str], list[tuple[torch.Tensor, torch.Tensor]]
+    ] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Normalize legacy dense history while keeping factor history compact."""
@@ -132,13 +135,23 @@ def _past_tensor_for_name(
         resolved = _past_factors_for_name(state, name)
         if resolved is None:
             return None
-        _, factors = resolved
+        resolved_name, factors = resolved
         target_device = torch.device(device) if device is not None else torch.device("cpu")
+        factor_cache_key = (resolved_name, str(target_device))
+        cached_factors = state._past_factor_cache.get(factor_cache_key)
+        if cached_factors is None:
+            cached_factors = [
+                (
+                    b.detach().to(device=target_device, dtype=_PAST_SUM_DTYPE),
+                    a.detach().to(device=target_device, dtype=_PAST_SUM_DTYPE),
+                )
+                for b, a in factors
+            ]
+            state._past_factor_cache[factor_cache_key] = cached_factors
+        factors = cached_factors
         historical: torch.Tensor | None = None
         for b, a in factors:
-            product = b.detach().to(device=target_device, dtype=_PAST_SUM_DTYPE) @ a.detach().to(
-                device=target_device, dtype=_PAST_SUM_DTYPE
-            )
+            product = b @ a
             historical = product if historical is None else historical + product
         return historical.detach() if historical is not None else None
     if device is None:
@@ -299,7 +312,8 @@ def compute_ella_penalty(
     deltas: Mapping[str, torch.Tensor],
     state: ELLAState,
     normalize_by_num_layers: bool = False,
-    loss_type: str = "ella"
+    loss_type: str = "ella",
+    subtract_past_tensor: bool = False,
 ) -> torch.Tensor:
     """Compute ELLA regularization term: sum || DeltaW_t ⊙ W_past ||_F^2."""
     if not deltas:
@@ -317,6 +331,8 @@ def compute_ella_penalty(
         )
         if past_sum is None:
             continue
+        if subtract_past_tensor:
+            delta = delta - past_sum
         if loss_type == "l4_subspace":
             term = _subspace_projection_penalty(delta, state, name, past_sum)
             total = term if total is None else total + term
@@ -390,6 +406,7 @@ def update_past_weights(
     """
     state._subspace_cache.clear()
     state._past_tensor_cache.clear()
+    state._past_factor_cache.clear()
     for name, value in deltas.items():
         key = _past_key_for_update(state, name)
         if torch.is_tensor(value):
@@ -427,6 +444,7 @@ def compute_ella_penalty_from_model(
     normalize_by_num_layers: bool = True,
     loss_type: str = "ella",
     delta_mode: str = "layerwise",
+    subtract_past_tensor: bool = False,
 ) -> torch.Tensor:
     """Compute the ELLA penalty using either layerwise or all-at-once deltas.
 
@@ -441,6 +459,7 @@ def compute_ella_penalty_from_model(
             state=state,
             normalize_by_num_layers=normalize_by_num_layers,
             loss_type=loss_type,
+            subtract_past_tensor=subtract_past_tensor,
         )
     if delta_mode != "layerwise":
         raise ValueError("delta_mode must be either 'layerwise' or 'all'.")
@@ -457,6 +476,7 @@ def compute_ella_penalty_from_model(
             state=state,
             normalize_by_num_layers=False,
             loss_type=loss_type,
+            subtract_past_tensor=subtract_past_tensor,
         )
         total = term if total is None else total + term
 
