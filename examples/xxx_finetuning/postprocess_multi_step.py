@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import shutil
 from collections.abc import Sequence
@@ -16,6 +17,41 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 torch.backends.cuda.matmul.allow_tf32 = True
 IGNORE_INDEX = -100
+DEFAULT_EXACT_JACOBIAN_LAYERS = frozenset(
+    {
+        "model.layers.0.self_attn.q_proj",
+        "model.layers.0.mlp.up_proj",
+        "model.layers.15.self_attn.q_proj",
+        "model.layers.15.mlp.up_proj",
+        "model.layers.31.self_attn.q_proj",
+        "model.layers.31.mlp.up_proj",
+    }
+)
+
+LOGGER = logging.getLogger("postprocess_multi_step")
+
+
+def configure_logger(save_path):
+    os.makedirs(save_path, exist_ok=True)
+
+    rank = os.environ.get("LOCAL_RANK", "0")
+    log_path = os.path.join(save_path, "postprocess.log")
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+
+    for handler in LOGGER.handlers[:]:
+        handler.close()
+        LOGGER.removeHandler(handler)
+
+    handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter(
+            f"%(asctime)s [rank={rank}] %(levelname)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    LOGGER.addHandler(handler)
+    return log_path
 
 
 @dataclass
@@ -56,10 +92,16 @@ class GlobalJacobianFreeProjector:
         delta_threshold: float = 0.95,
         beta: float = 0.7,
         min_alpha: float = 0.0,
-        chunk_size: int = 56
+        chunk_size: int = 56,
+        exact_jacobian_layers: Sequence[str] | None = None,
     ):
         self.r_jac_approx = r_jac_approx
         self.chunk_size = chunk_size
+        self.exact_jacobian_layers = set(
+            DEFAULT_EXACT_JACOBIAN_LAYERS
+            if exact_jacobian_layers is None
+            else exact_jacobian_layers
+        )
 
         if "LOCAL_RANK" in os.environ:
             local_rank = int(os.environ["LOCAL_RANK"])
@@ -69,7 +111,7 @@ class GlobalJacobianFreeProjector:
             self.device = torch.device("cuda:0")
         
         self.model = original_model.to(self.device)
-        # self.model.gradient_checkpointing_enable()
+        self.model.gradient_checkpointing_enable()
         finetuned_model = finetuned_model.to(self.device)
         self.target_layers = target_layers
         
@@ -127,7 +169,7 @@ class GlobalJacobianFreeProjector:
         return new_a_T.to(torch.float16), new_b_T.to(torch.float16)
 
     def _get_projection_components(self, dataloader, target_jac_dir, for_landing_point=False, global_proj=False, save_exact_jacobian=False):
-        print("Calculating Jacobian and projection components...")
+        LOGGER.info("Calculating Jacobian and projection components...")
         assert not global_proj, "Global projection is not currently supported in this implementation."
         m_total = len(dataloader.dataset)
         device = self.device
@@ -142,6 +184,20 @@ class GlobalJacobianFreeProjector:
         #* Projection correction term P for each layer
         P = {}
 
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        exact_jacobian_dir = os.path.abspath(
+            os.path.join(target_jac_dir, os.pardir, os.pardir, "activation_dumps")
+        )
+        if save_exact_jacobian:
+            # Save one file per rank and batch so that earlier batches are not overwritten.
+            if rank == 0:
+                shutil.rmtree(exact_jacobian_dir, ignore_errors=True)
+            if dist.is_initialized():
+                dist.barrier()
+            os.makedirs(exact_jacobian_dir, exist_ok=True)
+
+        current_batch_idx = -1
+
         all_modules = [(name, self.model.get_submodule(name)) for name in self.target_layers]
         module_chunks = [all_modules[i:i + self.chunk_size] for i in range(0, len(all_modules), self.chunk_size)]
 
@@ -149,7 +205,7 @@ class GlobalJacobianFreeProjector:
             module.weight.requires_grad = False
         
         for chunk_idx, chunk in enumerate(module_chunks):
-            print(f"\n=== Processing Layer Chunk {chunk_idx + 1}/{len(module_chunks)} ===")
+            LOGGER.info("=== Processing Layer Chunk %s/%s ===", chunk_idx + 1, len(module_chunks))
             
             jac_w_cache = {name: {'a': [], 'b': []} for name, _ in chunk}
             hooks = []
@@ -172,19 +228,31 @@ class GlobalJacobianFreeProjector:
                         )  
                         jac_w_a, jac_w_b = jac_w_a.contiguous(), jac_w_b.contiguous()
 
-                        if save_exact_jacobian:
-                            if "model.layers.0.self_attn.q_proj" in layer_name or \
-                            "model.layers.0.mlp.up_proj" in layer_name or \
-                            "model.layers.15.self_attn.q_proj" in layer_name or \
-                            "model.layers.15.mlp.up_proj" in layer_name or \
-                            "model.layers.31.self_attn.q_proj" in layer_name or \
-                            "model.layers.31.mlp.up_proj" in layer_name:
-                                file_path = f"{target_jac_dir}/../exact_{layer_name.replace('.', '-')}.safetensors"
-                                save_file({"fwd": fwd_activation.cpu(), "bwd": bwd_activation.cpu()}, file_path)
-                                file_path = f"{target_jac_dir}/../compressed_{layer_name.replace('.', '-')}.safetensors"
-                                save_file({"fwd": jac_w_a.cpu(), "bwd": jac_w_b.cpu()}, file_path)
-                                file_path = f"{target_jac_dir}/../deltaw_{layer_name.replace('.', '-')}.safetensors"
-                                save_file({"delta_w": self.delta_w_dict[layer_name].cpu()}, file_path)
+                        if save_exact_jacobian and layer_name in self.exact_jacobian_layers:
+                            layer_stem = layer_name.replace(".", "-")
+                            batch_stem = f"rank{rank:03d}_batch{current_batch_idx:05d}"
+                            exact_file_path = os.path.join(
+                                exact_jacobian_dir,
+                                f"exact_{layer_stem}_{batch_stem}.safetensors",
+                            )
+                            compressed_file_path = os.path.join(
+                                exact_jacobian_dir,
+                                f"compressed_{layer_stem}_{batch_stem}.safetensors",
+                            )
+                            save_file(
+                                {
+                                    "fwd": fwd_activation.cpu().contiguous(),
+                                    "bwd": bwd_activation.cpu().contiguous(),
+                                },
+                                exact_file_path,
+                            )
+                            save_file(
+                                {
+                                    "fwd": jac_w_a.cpu().contiguous(),
+                                    "bwd": jac_w_b.cpu().contiguous(),
+                                },
+                                compressed_file_path,
+                            )
                         
                         if dist.is_initialized():
                             ws = dist.get_world_size()
@@ -204,12 +272,13 @@ class GlobalJacobianFreeProjector:
                 hooks.append(module.register_forward_hook(f_hook))
                 hooks.append(module.register_full_backward_hook(b_hook))
 
-            print("Calculating Jacobian ...")
+            LOGGER.info("Calculating Jacobian ...")
             count = 0
             for batch_inputs in dataloader:
                 count += 1
+                current_batch_idx = count - 1
                 if count % 10 == 0:
-                    print(f"  Batch {count}/{len(dataloader)}...")
+                    LOGGER.info("  Batch %s/%s...", count, len(dataloader))
                 batch_inputs = {k: v.to(self.device) for k, v in batch_inputs.items()}
                 self.model.zero_grad(set_to_none=True)
                 outputs = self.model(**batch_inputs)
@@ -225,6 +294,17 @@ class GlobalJacobianFreeProjector:
                 module.weight.requires_grad = False
 
             for name, _ in chunk:
+                if save_exact_jacobian and name in self.exact_jacobian_layers and rank == 0:
+                    layer_stem = name.replace(".", "-")
+                    delta_file_path = os.path.join(
+                        exact_jacobian_dir,
+                        f"deltaw_{layer_stem}.safetensors",
+                    )
+                    save_file(
+                        {"delta_w": self.delta_w_dict[name].cpu().contiguous()},
+                        delta_file_path,
+                    )
+
                 jac_w_a = torch.cat(jac_w_cache[name]['a'], dim=0)
                 jac_w_b = torch.cat(jac_w_cache[name]['b'], dim=0)
                 
@@ -305,7 +385,7 @@ class GlobalJacobianFreeProjector:
             cosines_dict = {}
         
         for name in names:
-            # print(f"Computing cross term for {name}...")
+            # LOGGER.info("Computing cross term for %s...", name)
             
             file_old = f"{jac_dir_old}/{name.replace('.', '-')}.safetensors"
             file_new = f"{jac_dir_new}/{name.replace('.', '-')}.safetensors"
@@ -330,7 +410,7 @@ class GlobalJacobianFreeProjector:
                 Cross_Gram_global += Cross_Gram_local
             else:
                 cosines_dict[name] = compute_mean_cosine(Gram_old[name], Gram_new[name], Cross_Gram_local, eps=eps)
-                # print(f"  {name} mean cosine of principal angles={cosines_dict[name]:.4f}")
+                # LOGGER.info("  %s mean cosine of principal angles=%.4f", name, cosines_dict[name])
 
         if global_proj:
             mean_cosine = compute_mean_cosine(Gram_old, Gram_new, Cross_Gram_global, eps=eps)
@@ -338,14 +418,21 @@ class GlobalJacobianFreeProjector:
             mean_cosine = sum(cosines_dict.values()) / len(cosines_dict)
         return mean_cosine
 
-    def dynamic_global_manifold_projection_optimized(self, dataloader, global_proj=False):
-        print("Clearing old Jacobian cache and preparing directories...")
+    def dynamic_global_manifold_projection_optimized(
+        self, dataloader, global_proj=False, save_exact_jacobian=False
+    ):
+        LOGGER.info("Clearing old Jacobian cache and preparing directories...")
         shutil.rmtree(self.jac_dir_old, ignore_errors=True)
         shutil.rmtree(self.jac_dir_new, ignore_errors=True)
         os.makedirs(self.jac_dir_old, exist_ok=True)
         os.makedirs(self.jac_dir_new, exist_ok=True)
         
-        self.Gram_old, self.P_old = self._get_projection_components(dataloader, self.jac_dir_old, global_proj=global_proj, save_exact_jacobian=True)
+        self.Gram_old, self.P_old = self._get_projection_components(
+            dataloader,
+            self.jac_dir_old,
+            global_proj=global_proj,
+            save_exact_jacobian=save_exact_jacobian,
+        )
         
         while True:
             #* Searching for proper alpha with rollback mechanism, starting with a full step (alpha=1.0)
@@ -361,11 +448,17 @@ class GlobalJacobianFreeProjector:
                     updated_weight = module.weight.data + delta_w_projed
                     swallowed_ratio1 = (((delta_w - P) == delta_w) & (P.abs() > 1e-12)).float().mean().item()
                     swallowed_ratio2 = (module.weight.data == updated_weight).float().mean().item()
-                    print(f"{name}, P norm={P.norm().item():.8f}")
-                    print(f"{name}, delta W norm={delta_w.norm().item():.8f}")
-                    print(f"{name}, delta W projed norm={delta_w_projed.norm().item():.8f}")
-                    print(f"{name}, W norm={module.weight.data.norm().item():.8f}")
-                    print(f"{name} alpha={self.alpha:.4f}, swallowed_ratio1={swallowed_ratio1:.10f}, swallowed_ratio2={swallowed_ratio2:.10f}")
+                    LOGGER.info("%s, P norm=%.8f", name, P.norm().item())
+                    LOGGER.info("%s, delta W norm=%.8f", name, delta_w.norm().item())
+                    LOGGER.info("%s, delta W projed norm=%.8f", name, delta_w_projed.norm().item())
+                    LOGGER.info("%s, W norm=%.8f", name, module.weight.data.norm().item())
+                    LOGGER.info(
+                        "%s alpha=%.4f, swallowed_ratio1=%.10f, swallowed_ratio2=%.10f",
+                        name,
+                        self.alpha,
+                        swallowed_ratio1,
+                        swallowed_ratio2,
+                    )
                     module.weight.data.copy_(updated_weight)
                 
                 #* Calculating new global components with the updated model
@@ -378,15 +471,22 @@ class GlobalJacobianFreeProjector:
                     self.Gram_old, 
                     self.Gram_new
                 )
-                print(f"  [Inner] alpha={self.alpha:.4f}, global_mean_cos={mean_cos:.4f}")
+                LOGGER.info("  [Inner] alpha=%.4f, global_mean_cos=%.4f", self.alpha, mean_cos)
                 
                 if mean_cos > self.delta_threshold or self.alpha <= self.min_alpha:
-                    print(f"Global projection converged with alpha={self.alpha:.4f} and mean_cos={mean_cos:.4f}.")            
+                    LOGGER.info(
+                        "Global projection converged with alpha=%.4f and mean_cos=%.4f.",
+                        self.alpha,
+                        mean_cos,
+                    )
                     if dist.is_initialized():
                         dist.barrier()
                     break
                 else:
-                    print(f"  [Rollback] JANUS orientation comparison check failed, rolling back alpha={self.alpha:.4f} weights...")
+                    LOGGER.info(
+                        "  [Rollback] JANUS orientation comparison check failed, rolling back alpha=%.4f weights...",
+                        self.alpha,
+                    )
                     for name in self.target_layers:
                         module = self.model.get_submodule(name)
                         delta_w = self.delta_w_dict[name].to(self.device)
@@ -398,12 +498,15 @@ class GlobalJacobianFreeProjector:
                         self.alpha = self.min_alpha
                     
             if self.alpha == 1.0:
-                print("Converged with a full step, terminating projection process.")
+                LOGGER.info("Converged with a full step, terminating projection process.")
                 shutil.rmtree(self.jac_dir_old, ignore_errors=True)
                 shutil.rmtree(self.jac_dir_new, ignore_errors=True)
                 break
             else:
-                print(f"Converged with alpha={self.alpha:.4f}, updating old Jacobian cache for the next iteration...")
+                LOGGER.info(
+                    "Converged with alpha=%.4f, updating old Jacobian cache for the next iteration...",
+                    self.alpha,
+                )
                 shutil.rmtree(self.jac_dir_old, ignore_errors=True)
                 os.rename(self.jac_dir_new, self.jac_dir_old)
                 os.makedirs(self.jac_dir_new, exist_ok=True)
@@ -425,13 +528,20 @@ if __name__ == "__main__":
     parser.add_argument("--base_model_id", type=str)
     parser.add_argument("--finetuned_model_path", type=str)
     parser.add_argument("--finetuned_model_type", type=str, choices=["pissa", "lora", "ff"])
+    parser.add_argument("--residual_model_path", type=str, default=None)
+    parser.add_argument("--replay_dataset", type=str, default="nqopen")
+    parser.add_argument("--replay_size", type=int, default=256)
     parser.add_argument("--threshold", type=float, default=0.95)
     parser.add_argument("--beta", type=float, default=0.7)
     parser.add_argument("--min_alpha", type=float, default=0)
+    parser.add_argument("--r_jac_approx", type=int, default=32)
     parser.add_argument("--save_path", type=str)
+    parser.add_argument("--save_exact_jacobian", action="store_true",)
     args = parser.parse_args()
-    print(f"Projected model will be saved to {args.save_path}")
     os.makedirs(args.save_path, exist_ok=True)
+    log_path = configure_logger(args.save_path)
+    LOGGER.info("Logging to %s", log_path)
+    LOGGER.info("Projected model will be saved to %s", args.save_path)
     
     if "LOCAL_RANK" in os.environ:
         dist.init_process_group(backend="nccl")
@@ -446,10 +556,10 @@ if __name__ == "__main__":
     
     knowledge_dataset = get_knowledge_data(
         # name="metamath", 
-        name="nqopen", 
+        name=args.replay_dataset, 
         tokenizer=tokenizer, 
         model_id=args.base_model_id, 
-        nsamples=256, 
+        nsamples=args.replay_size, 
         seed=233
     )
     data_collector = DataCollatorForSupervisedDataset(tokenizer)
@@ -468,13 +578,12 @@ if __name__ == "__main__":
         shuffle=False
     )
 
-    print(f"Rank {os.environ.get('LOCAL_RANK', 0)} is processing {len(dataloader)} batches.")
+    LOGGER.info("Rank %s is processing %s batches.", os.environ.get("LOCAL_RANK", 0), len(dataloader))
     
-    print("Loading original and finetuned models...")
+    LOGGER.info("Loading original and finetuned models...")
     if args.finetuned_model_type == "pissa":
         pissa_residual_model = AutoModelForCausalLM.from_pretrained(
-            # "/home/fit/lishbo/WORK/data/zhengzhilong/anticf/pissa_residual_model/Meta-Llama-3-8B",
-            "/home/fit/lishbo/WORK/data/zhengzhilong/anticf/pissa_residual_model/Llama-2-7b-hf",
+            args.residual_model_path,
             dtype=torch.float16,
         )
         finetuned_model = PeftModel.from_pretrained(
@@ -505,9 +614,9 @@ if __name__ == "__main__":
         dtype=torch.float16,
     )
     target_layers = [name for name, module in origin_model.named_modules() if isinstance(module, (Linear)) and "lm_head" not in name]
-    print(f"Target layers for projection: {target_layers}")
+    LOGGER.info("Target layers for projection: %s", target_layers)
 
-    print("Initializing GlobalJacobianFreeProjector...")
+    LOGGER.info("Initializing GlobalJacobianFreeProjector...")
     projector = GlobalJacobianFreeProjector(
         # original_model=finetuned_model,
         # finetuned_model=origin_model,
@@ -515,17 +624,21 @@ if __name__ == "__main__":
         finetuned_model=finetuned_model,
         target_layers=target_layers,
         cache_dir=f"{args.save_path}/jac_cache",
+        r_jac_approx=args.r_jac_approx,
         delta_threshold=args.threshold,
         beta=args.beta,
         min_alpha=args.min_alpha
     )
-    print("Starting dynamic global manifold projection...")
-    projected_model = projector.dynamic_global_manifold_projection_optimized(dataloader)
+    LOGGER.info("Starting dynamic global manifold projection...")
+    projected_model = projector.dynamic_global_manifold_projection_optimized(
+        dataloader,
+        save_exact_jacobian=args.save_exact_jacobian,
+    )
     
     projected_model = projected_model.to(torch.bfloat16)
     projected_model.save_pretrained(args.save_path)
     tokenizer.save_pretrained(args.save_path)
-    print(f"Projected model and tokenizer saved to {args.save_path}.")
+    LOGGER.info("Projected model and tokenizer saved to %s.", args.save_path)
 
     if dist.is_initialized():
         dist.destroy_process_group()
