@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Literal, Optional
+from typing import Dict, Iterator, Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -39,19 +39,22 @@ def _normalize_module_name(name: str) -> str:
     return name
 
 
-def collect_lora_deltas(
+def iter_lora_deltas(
     model: torch.nn.Module,
     *,
     jumplora_ella_delta_mode: Optional[JumploraEllaDeltaMode] = None,
-) -> Dict[str, torch.Tensor]:
-    """Collect effective LoRA weight deltas for all LoRA layers.
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield effective LoRA weight deltas one layer at a time.
 
     JumpLoRA: effective ΔW for the ELLA penalty follows ``jumplora_ella_delta_mode`` (or
     ``model._ella_jumplora_ella_delta_mode``): ``interpolated`` matches the forward blend;
     ``sparse`` matches the legacy branch on ``jump_interpolation_factor``.
-    """
-    deltas: Dict[str, torch.Tensor] = {}
 
+    Keeping this as a generator is important for ELLA: materializing all dense
+    ``B @ A`` matrices at once can consume a large amount of GPU memory for a
+    large model. Callers that need the old all-at-once behavior can use
+    :func:`collect_lora_deltas`.
+    """
     try:
         from .jump_lora import JumpLoRALinear as _JumpLoRALinear
         from .jump_lora import jumplora_linear_threshold_exp as _thr_exp
@@ -74,13 +77,13 @@ def collect_lora_deltas(
                     module.jump_interpolation_factor * delta_jump
                     + (1.0 - module.jump_interpolation_factor) * delta_raw
                 )
-                deltas[name] = eff * module.scaling
+                yield name, eff * module.scaling
             else:
                 if module.jump_interpolation_factor > 0.0:
                     delta = delta_raw * (delta_raw.abs() > threshold).to(delta_raw.dtype)
-                    deltas[name] = delta * module.scaling
+                    yield name, delta * module.scaling
                 else:
-                    deltas[name] = delta_raw * module.scaling
+                    yield name, delta_raw * module.scaling
             continue
 
         lora_a = getattr(module, "lora_A", None)
@@ -101,9 +104,22 @@ def collect_lora_deltas(
         if getattr(module, "fan_in_fan_out", False):
             delta = delta.t()
 
-        deltas[name] = delta
+        yield name, delta
 
-    return deltas
+
+def collect_lora_deltas(
+    model: torch.nn.Module,
+    *,
+    jumplora_ella_delta_mode: Optional[JumploraEllaDeltaMode] = None,
+) -> Dict[str, torch.Tensor]:
+    """Collect effective LoRA weight deltas for all LoRA layers.
+
+    This preserves the original all-at-once API. ELLA's model-level penalty
+    uses :func:`iter_lora_deltas` directly so it does not need to retain every
+    dense delta matrix simultaneously.
+    """
+    return dict(iter_lora_deltas(model, jumplora_ella_delta_mode=jumplora_ella_delta_mode))
+
 
 
 def reset_lora_weights(model: nn.Module) -> None:

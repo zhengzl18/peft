@@ -10,10 +10,12 @@ from .lora_utils import (
     _active_adapter_name,
     _normalize_module_name,
     collect_lora_deltas,
+    iter_lora_deltas,
 )
 
 
 _SUBSPACE_EIGENVALUE_RTOL = 1e-4
+_PAST_SUM_DTYPE = torch.float16
 
 
 @dataclass
@@ -31,18 +33,18 @@ class ELLAState:
         tuple[str, str],
         tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor],
     ] = field(default_factory=dict, init=False, repr=False)
+    # Device/dtype-specific copies of ``past_sum``.  The serialized state
+    # remains CPU-backed, while training reuses these copies between steps.
+    _past_tensor_cache: Dict[tuple[str, str, str], torch.Tensor] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
-        """Populate the cache when constructing state from factor data directly."""
-        for key, value in self.past.items():
-            if key in self.past_sum or torch.is_tensor(value):
-                continue
-            if value:
-                first_b, first_a = value[0]  # type: ignore[index]
-                total = first_b @ first_a
-                for b, a in value[1:]:  # type: ignore[index]
-                    total = total + b @ a
-                self.past_sum[key] = total
+        """Normalize legacy dense history while keeping factor history compact."""
+        self.past_sum = {
+            key: value.to(dtype=_PAST_SUM_DTYPE)
+            for key, value in self.past_sum.items()
+        }
 
     def save(self, path: str | Path) -> None:
         payload = {"past": {}, "past_sum": {}}
@@ -53,7 +55,10 @@ class ELLAState:
                 payload["past"][key] = [
                     (b.detach().cpu(), a.detach().cpu()) for b, a in value  # type: ignore[union-attr]
                 ]
-        payload["past_sum"] = {k: v.detach().cpu() for k, v in self.past_sum.items()}
+        payload["past_sum"] = {
+            k: v.detach().to(device="cpu", dtype=_PAST_SUM_DTYPE)
+            for k, v in self.past_sum.items()
+        }
         torch.save(payload, path)
 
     @classmethod
@@ -89,25 +94,70 @@ class ELLAState:
             for key, value in raw_sum.items():
                 if not torch.is_tensor(value):
                     raise TypeError(f"ELLA past_sum key '{key}' is not a tensor.")
-                sums[key] = value
+                sums[key] = value.to(dtype=_PAST_SUM_DTYPE)
         for key, value in out.items():
             if key not in sums and torch.is_tensor(value):
-                sums[key] = value
+                sums[key] = value.to(dtype=_PAST_SUM_DTYPE)
         return cls(past=out, past_sum=sums)
 
 
-def _past_tensor_for_name(state: ELLAState, name: str) -> torch.Tensor | None:
-    if name in state.past_sum:
-        return state.past_sum[name]
-    if name in state.past and torch.is_tensor(state.past[name]):
-        return state.past[name]  # legacy/in-memory compatibility
+def _past_tensor_for_name(
+    state: ELLAState,
+    name: str,
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor | None:
+    """Return a historical tensor, caching device copies for repeated steps."""
+    candidates = [name]
     if not name.startswith("module."):
-        prefixed = f"module.{name}"
-        if prefixed in state.past_sum:
-            return state.past_sum[prefixed]
-        if prefixed in state.past and torch.is_tensor(state.past[prefixed]):
-            return state.past[prefixed]
-    return None
+        candidates.append(f"module.{name}")
+
+    resolved_name: str | None = None
+    tensor: torch.Tensor | None = None
+    for candidate in candidates:
+        if candidate in state.past_sum:
+            resolved_name = candidate
+            tensor = state.past_sum[candidate]
+            break
+        if candidate in state.past and torch.is_tensor(state.past[candidate]):
+            resolved_name = candidate
+            tensor = state.past[candidate]  # legacy/in-memory compatibility
+            break
+
+    if tensor is None:
+        # New states store historical low-rank factors. Reconstruct the dense
+        # historical delta only for this penalty evaluation; the state itself
+        # does not retain a dense past_sum for factor-based entries.
+        resolved = _past_factors_for_name(state, name)
+        if resolved is None:
+            return None
+        _, factors = resolved
+        target_device = torch.device(device) if device is not None else torch.device("cpu")
+        historical: torch.Tensor | None = None
+        for b, a in factors:
+            product = b.detach().to(device=target_device, dtype=_PAST_SUM_DTYPE) @ a.detach().to(
+                device=target_device, dtype=_PAST_SUM_DTYPE
+            )
+            historical = product if historical is None else historical + product
+        return historical.detach() if historical is not None else None
+    if device is None:
+        return tensor
+
+    target_device = torch.device(device)
+    # Keep the persistent GPU cache compact regardless of the model's
+    # compute dtype (the training model is commonly bfloat16).
+    target_dtype = _PAST_SUM_DTYPE
+    if tensor.device == target_device and tensor.dtype == target_dtype:
+        return tensor
+
+    assert resolved_name is not None
+    cache_key = (resolved_name, str(target_device), str(target_dtype))
+    cached = state._past_tensor_cache.get(cache_key)
+    if cached is None:
+        cached = tensor.to(device=target_device, dtype=target_dtype)
+        state._past_tensor_cache[cache_key] = cached
+    return cached
 
 
 def _past_key_for_update(state: ELLAState, name: str) -> str:
@@ -118,6 +168,17 @@ def _past_key_for_update(state: ELLAState, name: str) -> str:
         if prefixed in state.past or prefixed in state.past_sum:
             return prefixed
     return name
+
+
+def _has_past_for_name(state: ELLAState, name: str) -> bool:
+    candidates = [name]
+    if not name.startswith("module."):
+        candidates.append(f"module.{name}")
+    return any(
+        candidate in state.past_sum
+        or candidate in state.past
+        for candidate in candidates
+    )
 
 
 def _past_factors_for_name(
@@ -248,7 +309,12 @@ def compute_ella_penalty(
     count = 0
 
     for name, delta in deltas.items():
-        past_sum = _past_tensor_for_name(state, name)
+        past_sum = _past_tensor_for_name(
+            state,
+            name,
+            device=delta.device,
+            dtype=delta.dtype,
+        )
         if past_sum is None:
             continue
         if loss_type == "l4_subspace":
@@ -256,9 +322,11 @@ def compute_ella_penalty(
             total = term if total is None else total + term
             count += 1
             continue
-        past_tensor = past_sum.to(device=delta.device, dtype=delta.dtype)
+        past_tensor = past_sum
+        if delta.dtype != _PAST_SUM_DTYPE:
+            delta = delta.to(dtype=_PAST_SUM_DTYPE)
         if loss_type == "ella":
-            term = torch.sum((delta * past_tensor) ** 2)
+            term = torch.sum((delta * past_tensor) ** 2, dtype=torch.float32)
         elif loss_type in ("l3"):
             term = torch.sum(torch.sum(delta * past_tensor, dim=1) ** 2)
         elif loss_type in ("l3_normalized"):
@@ -321,17 +389,20 @@ def update_past_weights(
     retained as a compatibility path for callers that still provide deltas.
     """
     state._subspace_cache.clear()
+    state._past_tensor_cache.clear()
     for name, value in deltas.items():
         key = _past_key_for_update(state, name)
         if torch.is_tensor(value):
             d = value.detach().cpu()
+            d_sum = d.to(dtype=_PAST_SUM_DTYPE)
             if key in state.past and torch.is_tensor(state.past[key]):
                 state.past[key] = state.past[key] + d
             elif key not in state.past:
                 state.past[key] = d.clone()
             else:
                 raise TypeError(f"Cannot mix tensor and factor-list state for '{key}'.")
-            state.past_sum[key] = state.past_sum.get(key, torch.zeros_like(d)) + d
+            previous = state.past_sum.get(key)
+            state.past_sum[key] = d_sum if previous is None else previous.to(dtype=_PAST_SUM_DTYPE) + d_sum
             continue
         if isinstance(value, Mapping):
             b, a = value.get("B"), value.get("A")
@@ -346,18 +417,56 @@ def update_past_weights(
             raise TypeError(f"Cannot mix tensor and factor-list state for '{key}'.")
         b_cpu, a_cpu = b.detach().cpu().clone(), a.detach().cpu().clone()
         factors.append((b_cpu, a_cpu))  # type: ignore[union-attr]
-        product = b_cpu @ a_cpu
-        state.past_sum[key] = state.past_sum.get(key, torch.zeros_like(product)) + product
+        # Factor-based history remains compact. A dense historical delta is
+        # reconstructed only when the penalty for this layer is evaluated.
 
 
 def compute_ella_penalty_from_model(
     model: torch.nn.Module,
     state: ELLAState,
     normalize_by_num_layers: bool = True,
-    loss_type: str = "ella"
+    loss_type: str = "ella",
+    delta_mode: str = "layerwise",
 ) -> torch.Tensor:
-    deltas = collect_lora_deltas(model)
-    return compute_ella_penalty(deltas=deltas, state=state, normalize_by_num_layers=normalize_by_num_layers, loss_type=loss_type)
+    """Compute the ELLA penalty using either layerwise or all-at-once deltas.
+
+    ``layerwise`` avoids materializing the complete delta mapping before
+    computing the penalty. ``all`` preserves the original behavior and is
+    useful for comparisons or callers that prefer the simpler execution path.
+    """
+    if delta_mode == "all":
+        deltas = collect_lora_deltas(model)
+        return compute_ella_penalty(
+            deltas=deltas,
+            state=state,
+            normalize_by_num_layers=normalize_by_num_layers,
+            loss_type=loss_type,
+        )
+    if delta_mode != "layerwise":
+        raise ValueError("delta_mode must be either 'layerwise' or 'all'.")
+
+    total: torch.Tensor | None = None
+    count = 0
+    for name, delta in iter_lora_deltas(model):
+        # Count only layers that actually have a historical ELLA direction,
+        # matching compute_ella_penalty's normalization semantics.
+        if _has_past_for_name(state, name):
+            count += 1
+        term = compute_ella_penalty(
+            deltas={name: delta},
+            state=state,
+            normalize_by_num_layers=False,
+            loss_type=loss_type,
+        )
+        total = term if total is None else total + term
+
+    if total is None:
+        parameter = next(model.parameters(), None)
+        return parameter.new_tensor(0.0) if parameter is not None else torch.tensor(0.0)
+
+    if normalize_by_num_layers and count > 0:
+        total = total / count
+    return total
 
 
 def project_lora_deltas_orthogonal(
