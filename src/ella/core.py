@@ -15,7 +15,7 @@ from .lora_utils import (
 
 
 _SUBSPACE_EIGENVALUE_RTOL = 1e-4
-_PAST_SUM_DTYPE = torch.float16
+_PAST_SUM_DTYPE = torch.float32
 
 
 @dataclass
