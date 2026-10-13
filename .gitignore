@@ -147,3 +147,8 @@ method_comparison/MetaMathQA/temporary_results/
 output
 result
 singular_values
+examples/xxx_finetuning/artifacts_mlp_xxx_antiforgetting
+examples/artifacts_frequency_direction_mlp
+examples/artifacts_mlp_sin_lora
+scripts/*.pdf
+scripts/*.png
