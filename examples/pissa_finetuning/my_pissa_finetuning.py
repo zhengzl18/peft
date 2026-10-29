@@ -158,6 +158,20 @@ class TrainingArguments(transformers.TrainingArguments):
         default="layerwise",
         metadata={"help": "Delta computation mode: 'layerwise' or 'all'."},
     )
+    ella_past_sum_dtype: str = field(
+        default="bfloat16",
+        metadata={"help": "Torch dtype used to store and compute ELLA past sums (for example, bfloat16 or float32)."},
+    )
+
+
+def _resolve_torch_dtype(name: str) -> torch.dtype:
+    dtype = getattr(torch, name.removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype):
+        raise ValueError(
+            f"Invalid --ella_past_sum_dtype {name!r}; expected a torch dtype "
+            "such as 'bfloat16' or 'float32'."
+        )
+    return dtype
 
 
 def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> dict:
@@ -241,6 +255,7 @@ def train():
     parser = transformers.HfArgumentParser(TrainingArguments)
     script_args = parser.parse_args_into_dataclasses()[0]
     print(script_args)
+    ella_past_sum_dtype = _resolve_torch_dtype(script_args.ella_past_sum_dtype)
 
     if script_args.pissa_mode:
         print("Train in PiSSA mode")
@@ -282,11 +297,14 @@ def train():
             raise ValueError("ELLA training requires --pissa_mode True so the initial PiSSA deltaW is available.")
         # PiSSA starts with a non-zero low-rank update. Keep its initial factors
         # fixed as the historical deltaW used by the ELLA penalty.
-        ella_state = ELLAState()
+        ella_state = ELLAState(past_sum_dtype=ella_past_sum_dtype)
         update_past_weights_from_model(state=ella_state, model=model)
         if not ella_state.past:
             raise RuntimeError("Could not collect the initial PiSSA A/B factors for ELLA.")
-        print(f"ELLA enabled: lambda={script_args.ella_lambda}, loss_type={script_args.ella_loss_type}")
+        print(
+            f"ELLA enabled: lambda={script_args.ella_lambda}, "
+            f"loss_type={script_args.ella_loss_type}, past_sum_dtype={ella_state.past_sum_dtype}"
+        )
 
     if script_args.local_rank == 0:
         trainable_params, all_param = get_nb_trainable_parameters(model)

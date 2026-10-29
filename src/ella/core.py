@@ -15,7 +15,7 @@ from .lora_utils import (
 
 
 _SUBSPACE_EIGENVALUE_RTOL = 1e-4
-_PAST_SUM_DTYPE = torch.float32
+_DEFAULT_PAST_SUM_DTYPE = torch.bfloat16
 
 
 @dataclass
@@ -29,6 +29,7 @@ class ELLAState:
 
     past: Dict[str, object] = field(default_factory=dict)
     past_sum: Dict[str, torch.Tensor] = field(default_factory=dict)
+    past_sum_dtype: torch.dtype = _DEFAULT_PAST_SUM_DTYPE
     _subspace_cache: Dict[
         tuple[str, str],
         tuple[list[tuple[torch.Tensor, torch.Tensor]], torch.Tensor],
@@ -45,7 +46,7 @@ class ELLAState:
     def __post_init__(self) -> None:
         """Normalize legacy dense history while keeping factor history compact."""
         self.past_sum = {
-            key: value.to(dtype=_PAST_SUM_DTYPE)
+            key: value.to(dtype=self.past_sum_dtype)
             for key, value in self.past_sum.items()
         }
 
@@ -59,13 +60,18 @@ class ELLAState:
                     (b.detach().cpu(), a.detach().cpu()) for b, a in value  # type: ignore[union-attr]
                 ]
         payload["past_sum"] = {
-            k: v.detach().to(device="cpu", dtype=_PAST_SUM_DTYPE)
+            k: v.detach().to(device="cpu", dtype=self.past_sum_dtype)
             for k, v in self.past_sum.items()
         }
         torch.save(payload, path)
 
     @classmethod
-    def load(cls, path: str | Path, device: torch.device | str | None = None) -> "ELLAState":
+    def load(
+        cls,
+        path: str | Path,
+        device: torch.device | str | None = None,
+        past_sum_dtype: torch.dtype = _DEFAULT_PAST_SUM_DTYPE,
+    ) -> "ELLAState":
         payload = torch.load(path, map_location=device if device is not None else "cpu")
         if not isinstance(payload, dict):
             raise TypeError("Expected dict payload for ELLA state.")
@@ -97,11 +103,11 @@ class ELLAState:
             for key, value in raw_sum.items():
                 if not torch.is_tensor(value):
                     raise TypeError(f"ELLA past_sum key '{key}' is not a tensor.")
-                sums[key] = value.to(dtype=_PAST_SUM_DTYPE)
+                sums[key] = value.to(dtype=past_sum_dtype)
         for key, value in out.items():
             if key not in sums and torch.is_tensor(value):
-                sums[key] = value.to(dtype=_PAST_SUM_DTYPE)
-        return cls(past=out, past_sum=sums)
+                sums[key] = value.to(dtype=past_sum_dtype)
+        return cls(past=out, past_sum=sums, past_sum_dtype=past_sum_dtype)
 
 
 def _past_tensor_for_name(
@@ -142,8 +148,8 @@ def _past_tensor_for_name(
         if cached_factors is None:
             cached_factors = [
                 (
-                    b.detach().to(device=target_device, dtype=_PAST_SUM_DTYPE),
-                    a.detach().to(device=target_device, dtype=_PAST_SUM_DTYPE),
+                    b.detach().to(device=target_device, dtype=state.past_sum_dtype),
+                    a.detach().to(device=target_device, dtype=state.past_sum_dtype),
                 )
                 for b, a in factors
             ]
@@ -160,7 +166,7 @@ def _past_tensor_for_name(
     target_device = torch.device(device)
     # Keep the persistent GPU cache compact regardless of the model's
     # compute dtype (the training model is commonly bfloat16).
-    target_dtype = _PAST_SUM_DTYPE
+    target_dtype = state.past_sum_dtype
     if tensor.device == target_device and tensor.dtype == target_dtype:
         return tensor
 
@@ -339,23 +345,23 @@ def compute_ella_penalty(
             count += 1
             continue
         past_tensor = past_sum
-        if delta.dtype != _PAST_SUM_DTYPE:
-            delta = delta.to(dtype=_PAST_SUM_DTYPE)
+        if delta.dtype != state.past_sum_dtype:
+            delta = delta.to(dtype=state.past_sum_dtype)
         if loss_type == "ella":
             term = torch.sum((delta * past_tensor) ** 2, dtype=torch.float32)
         elif loss_type in ("l3"):
             term = torch.sum(torch.sum(delta * past_tensor, dim=1) ** 2)
         elif loss_type in ("l3_normalized"):
             term = torch.sum(
-                torch.sum(delta * past_tensor, dim=1) ** 2
-                / (torch.sum(past_tensor * past_tensor, dim=1) + 1e-12)
+                torch.sum(delta * past_tensor, dim=1, dtype=torch.float32) ** 2
+                / (torch.sum(past_tensor * past_tensor, dim=1, dtype=torch.float32) + 1e-12)
             )
         elif loss_type in ("l4", "l4_proj"):
             term = torch.sum(delta * past_tensor) ** 2
         elif loss_type in ("l4_abs"):
             term = torch.abs(torch.sum(delta * past_tensor))
         elif loss_type in ("l4_normalized"):
-            term = (torch.sum(delta * past_tensor)) ** 2 / (torch.sum(past_tensor * past_tensor) + 1e-12)
+            term = (torch.sum(delta * past_tensor, dtype=torch.float32)) ** 2 / (torch.sum(past_tensor * past_tensor, dtype=torch.float32) + 1e-12)
         elif loss_type == "l4_per_task":
             factors = state.past[name] if name in state.past else state.past[f"module.{name}"]
             task_terms = []
@@ -411,7 +417,7 @@ def update_past_weights(
         key = _past_key_for_update(state, name)
         if torch.is_tensor(value):
             d = value.detach().cpu()
-            d_sum = d.to(dtype=_PAST_SUM_DTYPE)
+            d_sum = d.to(dtype=state.past_sum_dtype)
             if key in state.past and torch.is_tensor(state.past[key]):
                 state.past[key] = state.past[key] + d
             elif key not in state.past:
@@ -419,7 +425,11 @@ def update_past_weights(
             else:
                 raise TypeError(f"Cannot mix tensor and factor-list state for '{key}'.")
             previous = state.past_sum.get(key)
-            state.past_sum[key] = d_sum if previous is None else previous.to(dtype=_PAST_SUM_DTYPE) + d_sum
+            state.past_sum[key] = (
+                d_sum
+                if previous is None
+                else previous.to(dtype=state.past_sum_dtype) + d_sum
+            )
             continue
         if isinstance(value, Mapping):
             b, a = value.get("B"), value.get("A")
