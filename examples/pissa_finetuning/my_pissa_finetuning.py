@@ -237,7 +237,7 @@ class DataCollatorForSupervisedDataset:
         }
 
 
-def train_tokenize_function(examples, tokenizer, query, response):
+def train_tokenize_function_for_pissa_dataset(examples, tokenizer, query, response):
     sources = [
         PROMPT.format_map(
             {
@@ -247,6 +247,21 @@ def train_tokenize_function(examples, tokenizer, query, response):
         for instruction in examples[query]
     ]
     targets = [f"{output}\n{tokenizer.eos_token}" for output in examples[response]]
+    data_dict = preprocess(sources, targets, tokenizer)
+    return data_dict
+
+
+
+def train_tokenize_function_for_tulu3_if_dataset(examples, tokenizer, query, response):
+    sources = [
+        PROMPT.format_map(
+            {
+                "instruction": instruction[0]['content'],
+            }
+        )
+        for instruction in examples[query]
+    ]
+    targets = [f"{output[1]['content']}\n{tokenizer.eos_token}" for output in examples[response]]
     data_dict = preprocess(sources, targets, tokenizer)
     return data_dict
 
@@ -320,10 +335,14 @@ def train():
     )
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    task, num_split = script_args.sub_task.split(":")
-    split = f"{script_args.dataset_split}[:{num_split}]"
-    raw_train_datasets = load_dataset(script_args.data_path, data_dir=task, split=split)
-    # raw_train_datasets = load_dataset(script_args.data_path, split=script_args.dataset_split)
+    if "pissa-dataset" in script_args.data_path:
+        task, num_split = script_args.sub_task.split(":")
+        split = f"{script_args.dataset_split}[:{num_split}]"
+        raw_train_datasets = load_dataset(script_args.data_path, data_dir=task, split=split)
+        train_tokenize_function = train_tokenize_function_for_pissa_dataset
+    elif "tulu-3-sft-personas-instruction-following" in script_args.data_path:
+        raw_train_datasets = load_dataset(script_args.data_path, split=script_args.dataset_split)
+        train_tokenize_function = train_tokenize_function_for_tulu3_if_dataset
 
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -331,7 +350,7 @@ def train():
         train_tokenize_function,
         batched=True,
         batch_size=script_args.dataloader_batch_size,
-        num_proc=script_args.dataloader_num_proc,
+        num_proc=16,
         remove_columns=raw_train_datasets.column_names,
         load_from_cache_file=True,
         desc="Running tokenizer on train dataset",
